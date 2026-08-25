@@ -1,0 +1,7 @@
+Third-party code redistributed in this repository
+=================================================
+* dsv4f/serving/patches/omlx/** are modified copies of modules from the `omlx`
+  package (https://github.com/jundot/omlx). Two carry
+  SPDX-License-Identifier: Apache-2.0; one carries an Apple Inc. copyright
+  header. They are included so the exact serving stack can be reproduced, and
+  remain under their original licenses. See dsv4f/serving/patches/README.md.
