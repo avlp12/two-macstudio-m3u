@@ -1,6 +1,11 @@
 <!-- markdownlint-disable MD013 -->
 # two-macstudio-m3u
 
+<p align="center">
+  <img src="assets/logo.svg" alt="two-macstudio-m3u — reproducible MoE LLM serving on 2x Mac Studio M3 Ultra" width="820">
+</p>
+
+
 A reproducible playbook for serving large MoE LLMs on a **2 × Mac Studio M3 Ultra (512 GB)**
 cluster linked by **Thunderbolt 5**, using MLX.
 
@@ -295,3 +300,9 @@ larger Python modules under `dsv4f/` are in Korean — that is our working langu
 chose not to machine-translate several thousand lines of load-bearing commentary and risk
 drift from the code that is actually running. Every shell script, every entry point, and
 all of the documentation is English.
+
+---
+
+## License & attribution
+
+Copyright &copy; 2026 **avlp12** (*Alis volat propriis*). Code and documentation are released under the [MIT License](LICENSE); see [NOTICE](NOTICE) for third-party components. If this playbook helps your build, a link back is appreciated: [github.com/avlp12](https://github.com/avlp12) · [huggingface.co/avlp12](https://huggingface.co/avlp12) · X [@Alisvolatprop12](https://x.com/Alisvolatprop12).

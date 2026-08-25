@@ -1,0 +1,51 @@
+<svg width="1200" height="300" viewBox="0 0 1200 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="two-macstudio-m3u">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="0%" r="90%">
+      <stop offset="0%" stop-color="#142720"/>
+      <stop offset="65%" stop-color="#0B1512"/>
+    </radialGradient>
+  </defs>
+
+  <!-- ground -->
+  <rect x="0" y="0" width="1200" height="300" rx="16" fill="url(#glow)"/>
+  <rect x="0.5" y="0.5" width="1199" height="299" rx="15.5" fill="none" stroke="#24382E"/>
+
+  <!-- mark: two studios linked by TB5 -->
+  <g transform="translate(64,74)">
+    <!-- box A -->
+    <rect x="0" y="24" width="104" height="104" rx="14" fill="#101F18" stroke="#3E5F4C" stroke-width="2.5"/>
+    <circle cx="20" cy="112" r="4" fill="#557A63"/>
+    <circle cx="36" cy="112" r="4" fill="#557A63"/>
+    <!-- box B -->
+    <rect x="196" y="24" width="104" height="104" rx="14" fill="#101F18" stroke="#3E5F4C" stroke-width="2.5"/>
+    <circle cx="216" cy="112" r="4" fill="#557A63"/>
+    <circle cx="232" cy="112" r="4" fill="#557A63"/>
+    <!-- link: thunderbolt between boxes -->
+    <line x1="104" y1="76" x2="196" y2="76" stroke="#2E4A3B" stroke-width="7"/>
+    <polygon points="158,52 132,82 148,82 138,102 166,70 150,70"
+             fill="#E8A33D" stroke="#0B1512" stroke-width="4" stroke-linejoin="round"/>
+    <!-- pines rising from box A (identity) -->
+    <g transform="translate(24,-12)">
+      <polygon points="16,0 26,20 6,20" fill="#3E5F4C"/>
+      <polygon points="16,9 28,32 4,32" fill="#557A63"/>
+      <polygon points="44,6 52,22 36,22" fill="#3E5F4C"/>
+      <polygon points="44,13 54,32 34,32" fill="#4A6B58"/>
+    </g>
+    <!-- pines rising from box B -->
+    <g transform="translate(228,-6)">
+      <polygon points="14,0 23,18 5,18" fill="#3E5F4C"/>
+      <polygon points="14,8 25,27 3,27" fill="#557A63"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="Menlo, SFMono-Regular, Consolas, monospace">
+    <text x="430" y="128" font-size="56" font-weight="bold" fill="#EFF5F1" letter-spacing="-1">two-macstudio-<tspan fill="#E8A33D">m3u</tspan></text>
+    <text x="432" y="174" font-size="18" fill="#A8BDB2">reproducible MoE LLM serving &#183; 2&#215; Mac Studio M3 Ultra &#183; TB5 &#183; MLX</text>
+    <text x="432" y="220" font-size="17" fill="#6F8579">prefill 895 tok/s &#183; decode 45&#8211;47 tok/s &#183; bit-exact pipeline prefill</text>
+  </g>
+
+  <!-- copyright -->
+  <text x="1136" y="272" font-size="14" fill="#4E6156" text-anchor="end"
+        font-family="Menlo, SFMono-Regular, Consolas, monospace">&#169; 2026 avlp12 &#183; Alis volat propriis</text>
+</svg>
