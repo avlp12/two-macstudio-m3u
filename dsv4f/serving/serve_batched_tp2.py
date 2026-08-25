@@ -55,23 +55,52 @@ def main():
         print(f"[r{rank}] 제어 접속 완료", flush=True)
     mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
 
-    # ── 집합연산 워치독: bg.next()가 시한 내 안 돌아오면(=분산 교착) 즉시 자결.
-    # TERM-불응 좀비가 wired 70GB+를 쥔 채 잔존해 시스템 전체를 죽이는
-    # 2026-08-23 크래시의 재발 방지. os._exit는 wired를 즉시 반환한다.
+    # ── 진행-감시 워치독 ────────────────────────────────────────────────────
+    # 반드시 유한 시간에 끝나야 하는 구간(집합연산 bg.next / 제어 프레임 dispatch /
+    # PP2 빌드·이음새)에 들어갈 때 busy 를 세우고, 그 안에서 진행이 있을 때마다
+    # 타임스탬프를 갱신한다. **유휴 대기**(랭크1 메인 루프의 제어 프레임 대기,
+    # 랭크0 의 빈 인박스 폴링)는 정상적으로 무한정 길 수 있으므로 마킹하지 않는다.
+    #
+    # [2026-08-26] 이전 판은 `_wd["busy"]` 를 **아무도 True 로 세우지 않아** 통째로
+    # 데드코드였다(HOL 웨이브 지적). 아래 `_wd_busy` 로 실제 배선.
+    # [I296] 자결(os._exit)이 RDMA 오염→시스템 정지의 방아쇠임이 2회 실증 —
+    # 경보만 남기고 유지(정리는 오퍼레이터가 전체-박스 질서 재부팅으로).
+    # R2와 동일 원리: 행 중 프로세스는 죽이지 않는다.
     WATCHDOG_S = float(os.environ.get("TP2_WATCHDOG_S", "300"))
-    _wd = {"busy": False, "t": time.time()}
+    _wd = {"busy": 0, "t": time.time(), "tag": "-"}
+    _wdlog = logging.getLogger("tp2.watchdog")
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _wd_busy(tag):
+        """유한-시간 구간 마킹. 중첩 가능하며, 중첩 진입/이탈이 곧 '진행' 신호다."""
+        prev_tag = _wd["tag"]
+        _wd["busy"] += 1
+        _wd["t"] = time.time()
+        _wd["tag"] = tag
+        try:
+            yield
+        finally:
+            _wd["busy"] -= 1
+            _wd["t"] = time.time()      # 이탈 = 진행 → 바깥 구간 시한도 재장전
+            _wd["tag"] = prev_tag
+
     def _watchdog():
         while True:
             time.sleep(10)
             if _wd["busy"] and time.time() - _wd["t"] > WATCHDOG_S:
-                # [I296] 자결(os._exit)이 RDMA 오염→시스템 정지의 방아쇠임이
-                # 2회 실증 — 경보만 남기고 유지(정리는 오퍼레이터가 전체-박스
-                # 질서 재부팅으로). R2와 동일 원리: 행 중 프로세스는 죽이지 않는다.
-                open("/Users/Shared/tp2/WATCHDOG_ALERT", "a").write(
-                    f"{time.time()} r{rank} 집합연산 {WATCHDOG_S:.0f}s 무응답\n")
-                print(f"[r{rank}] 워치독 경보: 행 감지 — 자결 안 함, 오퍼레이터 개입 필요",
+                msg = (f"r{rank} 구간 '{_wd['tag']}' {WATCHDOG_S:.0f}s 무진행 "
+                       f"(depth={_wd['busy']}) — 행 의심")
+                try:
+                    open("/Users/Shared/tp2/WATCHDOG_ALERT", "a").write(
+                        f"{time.time()} {msg}\n")
+                except Exception:
+                    pass
+                _wdlog.error("워치독 경보: %s", msg)
+                print(f"[r{rank}] 워치독 경보: {msg} — 자결 안 함, 오퍼레이터 개입 필요",
                       flush=True)
-                _wd["t"] = time.time()
+                _wd["t"] = time.time()   # 재장전(경보는 WATCHDOG_S 마다 1회)
     threading.Thread(target=_watchdog, daemon=True).start()
     model, tok = load(args.model, lazy=True)
     _ck = os.environ.get("TP2_MTP_CKPT", "")
@@ -115,7 +144,8 @@ def main():
     _PP2_MIN = _pp2.min_tokens if _pp2 is not None else 1 << 30
     if _pp2 is not None:
         print(f"[r{rank}] PP2 프리필 활성 (split={_pp2.split} "
-              f"min_tokens={_PP2_MIN} chunk={_pp2.chunk})", flush=True)
+              f"min_tokens={_PP2_MIN} chunk={_pp2.chunk} "
+              f"priming={'on' if _pp2.priming else 'off'})", flush=True)
 
     def make_bg():
         return BatchGenerator(model, max_tokens=args.max_output_tokens,
@@ -277,8 +307,10 @@ def main():
                 # PP2 경로: 프리필을 BatchGenerator 밖(2박스 층-파이프라인)에서 끝내고
                 # 완성된 전층 캐시를 주입 — 스냅숏 적중과 동일한 삽입 계약.
                 # pref=len(key) 로 두어 스냅숏 캡처 대상에서 자연 제외(pending 미등록).
-                # ※ MTP 프라이밍은 BatchGenerator 프리필 forward 에 붙으므로 이 경로엔
-                #   없다 → take_primed 가 None → unprimed 폴백(설계된 안전 저하).
+                # ※ MTP 프라이밍: DSV4_PP2_PRIMING=1 이면 build_cache 안에서 양 랭크가
+                #   (hidden, next-token) 페어를 직접 fold 해 ctx 를 심는다 →
+                #   뒤이은 꼬리 토큰 forward 가 이음새를 잇고 take_primed 가 받는다.
+                #   게이트 off 면 종전대로 take_primed 가 None → unprimed 폴백.
                 pref = len(key)
                 _ta = time.perf_counter()
                 full = _pp2.build_cache(
@@ -345,24 +377,30 @@ def main():
         _nstep = 0
 
         def _r1_step():
-            prs, rs = bg.next()
+            with _wd_busy("r1:bg.next"):
+                prs, rs = bg.next()
             if prs:
                 snap_capture(bg, prs, pending)
 
         def _r1_seam():
             """PP2 청크 이음새(랭크1): r0 이 `seam_end` 를 보낼 때까지 프레임을 소비.
             스텝 수를 r0 이 데이터-주도로 정하므로(대기 프롬프트 유무) 프레임 열
-            자체가 계약이다 — 랭크1 은 세지 않고 따라가기만 하면 대칭이 보장된다."""
-            while True:
-                cmd = recv_frame_warm(sock)
-                op = cmd.get("op")
-                if op == "insert":
-                    # r0 이 PP2-적격 요청을 진행 중엔 절대 안 보내므로 재진입 없음.
-                    snap_insert(bg, cmd["items"], pending)
-                elif op == "step":
-                    _r1_step()
-                elif op in ("seam_end", "stop"):
-                    return
+            자체가 계약이다 — 랭크1 은 세지 않고 따라가기만 하면 대칭이 보장된다.
+
+            이음새 대기는 **유한 구간**이다(r0 이 반드시 seam_end 를 보낸다) →
+            워치독 마킹 대상. 메인 루프의 프레임 대기(유휴)와 구분된다."""
+            with _wd_busy("r1:seam"):
+                while True:
+                    cmd = recv_frame_warm(sock)
+                    op = cmd.get("op")
+                    if op == "insert":
+                        # r0 이 PP2-적격 요청을 진행 중엔 절대 안 보내므로 재진입 없음.
+                        with _wd_busy("r1:seam-insert"):
+                            snap_insert(bg, cmd["items"], pending)
+                    elif op == "step":
+                        _r1_step()
+                    elif op in ("seam_end", "stop"):
+                        return
 
         if PP2_INTERLEAVE:
             _seam["cb"] = _r1_seam
@@ -378,7 +416,11 @@ def main():
                     "DSV4_PP2_INTERLEAVE 가 랭크마다 다르게 설정됐는지 확인")
             if cmd.get("op") == "insert":
                 _t0 = time.perf_counter()
-                snap_insert(bg, cmd["items"], pending)
+                # PP2 빌드(2박스 TCP 파이프라인)·프라이밍 fold·insert_segments 가
+                # 전부 이 안이다 — 오늘 겪은 교착 2모드(PP2 소켓 정체, 이음새
+                # 프레임 열 어긋남)가 잡히는 지점.
+                with _wd_busy("r1:insert"):
+                    snap_insert(bg, cmd["items"], pending)
                 _t1 = time.perf_counter()
                 _nstep = 0
                 if TRACE:
@@ -387,7 +429,8 @@ def main():
                           f"insseg {_TR.get('insseg_ms', 0):.1f})", flush=True)
             elif cmd.get("op") == "step":
                 _t0 = time.perf_counter()
-                prs, rs = bg.next()
+                with _wd_busy("r1:bg.next"):
+                    prs, rs = bg.next()
                 _t1 = time.perf_counter()
                 if TRACE and _nstep < 6:
                     print(f"[trace-r1] step{_nstep} bg.next {(_t1 - _t0) * 1e3:.1f}ms"
@@ -448,12 +491,15 @@ def main():
                 _TR.clear()
                 _TR["t_enq"] = t_enq
                 _TR["q_ms"] = (t_pick - t_enq) * 1e3
-            control.dispatch({"op": "insert", "items": items})
+            with _wd_busy("r0:dispatch-insert"):
+                control.dispatch({"op": "insert", "items": items})
             t_disp = time.perf_counter()
             if is_pp2:
                 st["in_pp2"] = True
             try:
-                new_uids = snap_insert(bg, items, pending)
+                # PP2 빌드·프라이밍 fold·insert_segments 를 모두 덮는 유한 구간.
+                with _wd_busy("r0:insert" + ("-pp2" if is_pp2 else "")):
+                    new_uids = snap_insert(bg, items, pending)
             finally:
                 if is_pp2:
                     st["in_pp2"] = False
@@ -522,9 +568,11 @@ def main():
 
         def _step():
             t_s0 = time.perf_counter()
-            control.dispatch({"op": "step"})
+            with _wd_busy("r0:dispatch-step"):
+                control.dispatch({"op": "step"})
             t_s1 = time.perf_counter()
-            prs, rs = bg.next()
+            with _wd_busy("r0:bg.next"):
+                prs, rs = bg.next()
             t_s2 = time.perf_counter()
             if _TR.get("armed") and len(_TR.get("steps", [])) < 8:
                 _TR["steps"].append(((t_s1 - t_s0) * 1e3, (t_s2 - t_s1) * 1e3))
@@ -674,15 +722,17 @@ def main():
         _wt = min(int(os.environ.get("DSV4_WARMUP_TOKENS", "200")), max(1, _PP2_MIN - 1))
         _wids = (list(tok.encode("warmup")) * 64)[:_wt]
         _wpend: dict = {}
-        control.dispatch({"op": "insert", "items": [[_wids, 4]]})
-        snap_insert(bg, [(_wids, 4)], _wpend)
-        for _ in range(64):
-            control.dispatch({"op": "step"})
-            _prs, _rs = bg.next()
-            if _prs:
-                snap_capture(bg, _prs, _wpend)
-            if _rs and any(getattr(r, "finish_reason", None) for r in _rs):
-                break
+        with _wd_busy("r0:warmup"):
+            control.dispatch({"op": "insert", "items": [[_wids, 4]]})
+            snap_insert(bg, [(_wids, 4)], _wpend)
+            for _ in range(64):
+                control.dispatch({"op": "step"})
+                _prs, _rs = bg.next()
+                if _prs:
+                    snap_capture(bg, _prs, _wpend)
+                _wd["t"] = time.time()      # 스텝마다 진행 신호
+                if _rs and any(getattr(r, "finish_reason", None) for r in _rs):
+                    break
         print(f"[warmup] {_wt} tok 합성 시퀀스 완주 "
               f"{(time.perf_counter() - _t0) * 1e3:.0f}ms", flush=True)
 

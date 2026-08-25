@@ -111,9 +111,23 @@ def _npbytes(a):
     return n, tag
 
 
-def send_tensor(sock, name, a, **meta):
+def prepare_tensor(a):
+    """mx.array → (C-연속 numpy, dtype 태그, shape). **생산(메인) 스레드에서** 부를 것.
+
+    `_npbytes` 는 bf16/f16 에 대해 `a.view(mx.uint16)` 라는 **lazy mx 연산**을 만들고,
+    이어지는 `np.array(..., copy=False)` 가 그 그래프를 강제 평가한다. 이 두 줄이
+    sender 스레드에서 돌면 MLX 의 **스레드-로컬 기본 스트림**에 제출되므로
+    (기본 GPU 스트림은 스레드마다 다르다 — Alis Studio v0.5.2 "no Stream(gpu,0)"
+    사고와 같은 축), 생산 측에서 미리 물질화해 sender 는 순수 소켓 I/O 만 하게 한다.
+    """
     n, tag = _npbytes(a)
-    hdr = {"n": name, "d": tag, "s": list(a.shape)}
+    return n, tag, list(a.shape)
+
+
+def send_prepared(sock, name, prep, **meta):
+    """`prepare_tensor` 결과를 전송 — mx 연산 없음(sender 스레드 안전)."""
+    n, tag, shape = prep
+    hdr = {"n": name, "d": tag, "s": shape}
     hdr.update(meta)
     j = json.dumps(hdr).encode()
     sock.sendall(_HDR.pack(MAGIC, T_TENSOR, 4 + len(j) + n.nbytes))
@@ -121,6 +135,10 @@ def send_tensor(sock, name, a, **meta):
     sock.sendall(j)
     sock.sendall(n)
     return n.nbytes
+
+
+def send_tensor(sock, name, a, **meta):
+    return send_prepared(sock, name, prepare_tensor(a), **meta)
 
 
 def recv_msg(sock):
@@ -388,7 +406,16 @@ def _cache_arrays(cache):
 
 
 # ---------------------------------------------------------------------- server
-def _do_prefill(sock, sl, msg):
+def _do_prefill(sock, sl, msg, on_seam=None):
+    """하단 슬라이스 청크 프리필.
+
+    `on_seam` 이 주어지면 **청크 이음새마다** 호출된다(HOL 인터리브용). 호출 규약은
+    클라이언트(PP2Client.prefill)와 **정확히 같은 횟수**여야 한다 —
+      · 클라이언트: 청크 ci(0..N-1) 처리 **직후** 매번 → N 회
+      · 서버(여기): 청크 ci(**1**..N-1) 직후 → N-1 회 + 루프 종료 후 1 회 = N 회
+    서버가 첫 이음새를 건너뛰는 이유는 **파이프라인 한 청크 선행**을 유지하기 위함이다.
+    (동시성 유지: 이음새 i 시점에 서버는 P(i+1)까지, 클라이언트는 C(i)까지 완료)
+    """
     tokens = [int(t) for t in msg["tokens"]]
     sched = msg["schedule"]
     if sum(sched) != len(tokens):
@@ -400,13 +427,15 @@ def _do_prefill(sock, sl, msg):
     send_err = []
 
     def sender():
+        # 순수 소켓 I/O 만 — mx 연산은 전부 생산 스레드에서 끝났다(prepare_tensor).
         try:
             while True:
                 item = sendq.get()
                 if item is None:
                     return
-                name, arr, meta = item
-                send_tensor(sock, name, arr, **meta)
+                name, prep, keep, meta = item
+                send_prepared(sock, name, prep, **meta)
+                del keep, prep
         except Exception as e:
             send_err.append(e)
 
@@ -422,21 +451,31 @@ def _do_prefill(sock, sl, msg):
             tc = time.perf_counter()
             ids = toks[:, pos:pos + n]
             h = sl.forward(ids, ids, is_tokens=True)
-            # sender 스레드로 넘기기 전에 반드시 완전 평가 (스레드-로컬 스트림 함정)
+            # sender 스레드로 넘기기 전에 반드시 완전 평가 (스레드-로컬 스트림 함정).
+            # eval 뿐 아니라 **와이어 버퍼 물질화(prepare_tensor)까지** 여기서 끝낸다 —
+            # `_npbytes` 의 `view` 는 lazy mx 연산이라 sender 스레드에 남기면 안 된다.
             mx.eval(h, *sl.cache_arrays())
+            prep = prepare_tensor(h)
             mx.clear_cache()
             t_chunks.append(time.perf_counter() - tc)
             if send_err:
                 raise send_err[0]
             tq = time.perf_counter()
-            sendq.put(("act", h, {"c": ci}))   # 큐가 차 있으면 여기서 블록 = 배압
+            # `h` 를 함께 실어 전송이 끝날 때까지 원본 버퍼 수명을 보장한다.
+            sendq.put(("act", prep, h, {"c": ci}))   # 큐가 차 있으면 여기서 블록 = 배압
             t_idle.append(time.perf_counter() - tq)
             pos += n
+            if on_seam is not None and ci > 0:
+                on_seam()
     finally:
         sendq.put(None)
         st.join()
     if send_err:
         raise send_err[0]
+    if on_seam is not None:
+        # 마지막 이음새 — 클라이언트의 마지막 청크(C(N-1)) 뒤 이음새와 짝을 이룬다.
+        # 반드시 st.join() 뒤(= 마지막 활성 전송 완료 뒤)여야 클라이언트가 진행한다.
+        on_seam()
     send_json(sock, {
         "op": "prefill_done",
         "t_compute": time.perf_counter() - t0,
@@ -559,7 +598,13 @@ class PP2Client:
             pass
         self.sock.close()
 
-    def prefill(self, tokens, chunk, k=32):
+    def prefill(self, tokens, chunk, k=32, on_seam=None, tap=None):
+        """상단 슬라이스 청크 파이프라인. `on_seam` 규약은 `_do_prefill` 주석 참조.
+
+        `tap(ci, ids, h2, offset_after)`: 청크마다 **트렁크 최종 raw 4D hidden**
+        (norm/hc_head 이전 — 스톡 `return_raw_hidden` 이 내주는 바로 그 텐서)과
+        그 forward 직후의 캐시 offset 을 넘긴다. MTP 프롬프트 프라이밍 fold 용.
+        """
         tokens = [int(t) for t in tokens]
         n_pre = len(tokens)
         sched = make_schedule(n_pre, chunk)
@@ -618,12 +663,21 @@ class PP2Client:
             h2 = self.top.forward(h, ids, is_tokens=False)
             if ci == len(sched) - 1:
                 logits = self.top.tail_logits(h2, k=k)
-                mx.eval(logits, *self.top.cache_arrays())
+                # tap 이 걸려 있으면 마지막 청크도 h2 전 위치를 평가해야 한다
+                # (tail_logits 는 k 위치만 당기므로 나머지가 미평가로 남는다).
+                if tap is None:
+                    mx.eval(logits, *self.top.cache_arrays())
+                else:
+                    mx.eval(logits, h2, *self.top.cache_arrays())
             else:
                 mx.eval(h2, *self.top.cache_arrays())
+            if tap is not None:
+                tap(ci, ids, h2, self.top.offset())
             mx.clear_cache()
             t_local.append(time.perf_counter() - tc)
             pos += n
+            if on_seam is not None:
+                on_seam()
         t_pipeline = time.perf_counter() - t0
         rx_thread.join(timeout=60)
         if rx_err:

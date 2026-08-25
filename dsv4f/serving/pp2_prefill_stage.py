@@ -2,8 +2,8 @@
 
 설계(옵션A): **프리필만 PP2 로 교체하고 디코드는 검증된 TP2 경로를 그대로 둔다.**
   · 각 랭크는 TP2 샤딩 모델(디코드용)에 더해 **비샤딩 층 슬라이스**(프리필용)를 함께 적재.
-      rank0 = box A : 상단 layers[split, n) + TCP 클라이언트/오케스트레이터
-      rank1 = box B : 하단 layers[0, split) + TCP 서버
+      rank0 = box A   : 상단 layers[split, n) + TCP 클라이언트/오케스트레이터
+      rank1 = box B   : 하단 layers[0, split) + TCP 서버
   · PP2 청크 파이프라인으로 ids[:-1] 을 프리필 → 각 랭크가 자기 층들의 KV 만 보유.
   · **리샤드 = 양방향 교환**: DSv4 의 KV 경로(attn.wkv/kv_norm/compressor/indexer)는
     `Model.shard()` 가 건드리지 않고 kv 는 단일 헤드(B,1,L,head_dim) 이므로 캐시는
@@ -14,10 +14,11 @@
 PP2 소켓은 **원시 TCP** (mx.distributed 미사용) 라 서빙의 jaccl 집합연산과 공존한다.
 양 랭크가 완전히 대칭적으로 동일 op 순서를 밟으므로 락스텝이 유지된다.
 
-MTP 프롬프트 프라이밍: 프라이밍은 BatchGenerator 프리필 forward 에 올라타 캡처되므로
-  PP2 경로에서는 캡처가 일어나지 않는다 → `take_primed` 가 None 을 돌려주고
-  **unprimed 폴백**으로 조용히 degrade 한다(설계된 안전 경로). 그래서 본 모듈은
-  `min_tokens` 이상의 장문에만 적용되고, 짧은 요청은 기존 경로(프라이밍 유지)로 간다.
+MTP 프롬프트 프라이밍(`DSV4_PP2_PRIMING=1`): 프라이밍 캡처는 BatchGenerator 프리필
+  forward 에 올라타므로 PP2 경로에서는 원래 한 번도 안 불렸다 → `take_primed` 가
+  None → **unprimed 폴백**. 아래 `_PrimeFold` 가 프리필 중 이미 갖고 있는
+  (hidden, next-token) 페어를 `prompt_priming.maybe_capture` 로 직접 접어 되살린다.
+  게이트 OFF 면 종전과 정확히 동일한 경로(unprimed 폴백)다.
 
 근거 로그: ~/dsv4flash/align/logs/pp2int_{gate1,diag1,diag2,needle}.log
 """
@@ -33,6 +34,7 @@ import time
 sys.path.insert(0, "/Users/Shared/tp2")
 
 import mlx.core as mx  # noqa: E402
+import numpy as np  # noqa: E402
 
 from e2_pp2_prefill import (  # noqa: E402
     _HDR,
@@ -45,8 +47,12 @@ from e2_pp2_prefill import (  # noqa: E402
     _do_prefill,
     _npbytes,
     load_dsv4,
+    make_schedule,
+    prepare_tensor,
     recv_msg,
     send_json,
+    send_prepared,
+    to_mx,
     tune,
 )
 from e3_kv_handover import cache_offsets, cache_restore, cache_spec, to_mx_copy  # noqa: E402
@@ -167,6 +173,205 @@ def assemble_full(model_tp, wire_layers, wire_arrays, local_cache, lo_is_local, 
     return full
 
 
+# ------------------------------------------------------- MTP 프롬프트 프라이밍
+# 설계 근거와 계약(정본: omlx/patches/mlx_lm_mtp/prompt_priming.py 모듈 독스트링):
+#
+#  ① fold 대상 hidden = **트렁크 최종 raw 4D Hyper-stream hidden**.
+#     DSv4 캡처 사이트(`deepseek_v4_model.Model.__call__`)는 `return_raw_hidden=True`
+#     로 `norm(hc_head(h))` **이전**의 `h` 를 넘긴다("the head input variant; no
+#     trunk norm"). PP2 상단 슬라이스(rank0)의 `V4Slice.forward()` 반환값이 정확히
+#     그 텐서다 — 서빙 모델은 TP 샤딩이라 `pipeline_size==1`, 스톡 경로의
+#     recv/send/all_gather 가 모두 no-op 이므로 두 경로의 `h` 정의가 일치한다.
+#
+#  ② fold 는 `maybe_capture` 를 **그대로 호출**한다(재구현 아님). 청크마다
+#     (ids_chunk, hidden_chunk) 를 순서대로 넘기면 pending_hidden 이음새,
+#     offset-연속성 가드, "never a wrong history" 불변이 모듈 자신의 코드로 검증된다.
+#     결과 상태는 스톡 경로가 `key=ids[:-1]` 세그먼트를 프리필한 직후와 **동일**
+#     (folded == len(pre)-1, expected_offset == len(pre))이라, 뒤이은 꼬리 토큰
+#     forward → `_post_init_mtp` → `take_primed` 이음새가 무변경으로 이어진다.
+#
+#  ③ 앵커는 프리필 중 **실측한 슬라이스 캐시 offset** 을 되감아 쓴다(`_OffsetStub`).
+#     fold 시점의 라이브 캐시는 이미 len(pre) 에 멈춰 있어 앵커로 쓸 수 없다.
+#     스텁 값은 스케줄 누적합과 대조해 검증하므로 가드가 무력화되지 않는다.
+#
+#  ④ ctx 슬롯은 **대역 호스트**(`_PrimeHost`)에 둔다. HOL 이음새(DSV4_PP2_INTERLEAVE)
+#     가 돌리는 다른 요청의 프리필이 같은 model 슬롯에 ctx 를 쓰므로, 실모델 슬롯에
+#     바로 쓰면 서로 덮어써 **잘못된 히스토리**(접두가 빠진 ctx)가 만들어진다.
+#     완성·검증 직후에만 model 로 옮긴다.
+#
+#  ⑤ MTP 헤드는 TP2 샤딩(`dspark_tp4_common.shard_mtp`)이라 `mtp_forward` 는
+#     집합연산을 품을 수 있다 → **양 랭크가 같은 횟수·같은 형상으로** 접어야 한다.
+#     그래서 rank0 이 청크 hidden 을 rank1 로 보내고 둘 다 접는다. (rank1 이 안 접고
+#     완성 캐시만 받아오는 안은 집합연산 비대칭 = 교착 위험이라 기각. lazy 평가가
+#     로짓 꼬리를 지워 실제로는 집합연산이 안 뜰 수도 있으나, 그 가정에 서빙
+#     락스텝을 걸 수 없다.)
+_PRIME_ATTR_FALLBACK = "_omlx_mtp_prime_ctx"
+
+
+class _OffsetStub:
+    """`maybe_capture` 의 offset-연속성 가드에 실제 프리필 타임라인을 되먹이는 앵커.
+
+    `prompt_priming._anchor()` 는 plain-int `offset` 을 가진 첫 항목을 쓰므로
+    리스트에 이 객체 하나만 담아 넘긴다."""
+
+    __slots__ = ("offset",)
+
+    def __init__(self, offset=0):
+        self.offset = int(offset)
+
+
+class _PrimeHost:
+    """`maybe_capture` 계약은 그대로 두고 **ctx 슬롯만 분리**하는 얇은 대역 호스트.
+
+    `_host_candidates` 가 보는 건 자기 자신과 `language_model`/`_language_model`
+    뿐이라, 이 객체를 host 로 넘기면 ctx 가 여기에만 달린다(실모델 슬롯 무접촉).
+    `_host_eligible` 이 요구하는 3개 속성과 `make_mtp_cache`/`mtp_forward` 만
+    실모델로 위임한다."""
+
+    def __init__(self, model):
+        self._model = model
+        self._omlx_mtp_decode_enabled = getattr(
+            model, "_omlx_mtp_decode_enabled", False)
+        self._omlx_mtp_chain = getattr(model, "_omlx_mtp_chain", False)
+        self.mtp = getattr(model, "mtp", None)
+
+    def make_mtp_cache(self):
+        return self._model.make_mtp_cache()
+
+    def mtp_forward(self, *a, **kw):
+        return self._model.mtp_forward(*a, **kw)
+
+
+class _PrimeFold:
+    """양 랭크 대칭 MTP 프라이밍 fold. rank0 이 hidden 을 보내고 둘 다 접는다."""
+
+    def __init__(self, stage):
+        from omlx.patches.mlx_lm_mtp import prompt_priming
+
+        self.pp = prompt_priming
+        self.attr = getattr(prompt_priming, "_CTX_ATTR", _PRIME_ATTR_FALLBACK)
+        self.stage = stage
+        self.model_tp = stage.model_tp
+        self.host = _PrimeHost(stage.model_tp)
+        self.stub = _OffsetStub(0)
+        self.chunks = []          # rank0 전용: [(ids, hidden, offset_after)]
+        self.n_bytes = 0
+        self.n_fold = 0
+        # 헤드가 없거나 체인이 꺼져 있으면 maybe_capture 가 전부 조용히 무시하므로
+        # 457MB 전송·fold 를 아예 시작하지 않는다(판정은 rank0 이 프레임으로 통보).
+        self.eligible = bool(
+            getattr(self.host, "_omlx_mtp_decode_enabled", False)
+            and getattr(self.host, "_omlx_mtp_chain", False)
+            and self.host.mtp is not None
+            and prompt_priming.priming_enabled())
+
+    # -- rank0: 프리필 루프 탭 -------------------------------------------
+    def tap(self, ci, ids, hidden, offset_after):
+        self.chunks.append((ids, hidden, int(offset_after)))
+        self.n_bytes += int(hidden.size) * hidden.dtype.size
+
+    # -- 공통 fold 1스텝 --------------------------------------------------
+    def _fold(self, ids, hidden, offset_after):
+        # maybe_capture 는 "forward 가 이미 돌았고 offset 에 S 가 포함된" 상태를
+        # 가정하므로, 앵커를 그 시점 값으로 올려놓은 뒤 호출한다.
+        self.stub.offset = int(offset_after)
+        self.pp.maybe_capture(self.host, ids, hidden, [self.stub])
+        self.n_fold += 1
+
+    # -- 완성 ctx 검증 + 실모델 슬롯 설치 --------------------------------
+    def install(self, n_pre, log):
+        ctx = getattr(self.host, self.attr, None)
+        # 우리 요청이 곧 활성화되므로 다른 요청이 남긴 잔여 ctx 는 무조건 무효화한다
+        # (우연히 offset 이 맞아떨어져 **남의 히스토리**가 우리 것으로 소비되는 걸 차단.
+        #  그 요청은 어차피 배치가 다행이 되는 순간 patched_extend 가 폐기한다).
+        self.pp.drop_ctx(self.model_tp)
+        if self.n_fold == 0:
+            return 0                      # 이번 요청은 fold 생략 — 조용히 unprimed
+        if ctx is None or not getattr(ctx, "valid", False):
+            log("[prime] ctx 없음/무효 — unprimed 폴백")
+            return 0
+        if ctx.expected_offset != n_pre or ctx.folded != n_pre - 1:
+            log(f"[prime] 불변 위반 expected_offset={ctx.expected_offset} "
+                f"folded={ctx.folded} (기대 {n_pre}/{n_pre - 1}) — 폐기")
+            return 0
+        if ctx.pending_hidden is None:
+            log("[prime] pending_hidden 없음 — 폐기")
+            return 0
+        setattr(self.model_tp, self.attr, ctx)
+        return int(ctx.folded)
+
+    # -- rank0 드라이브 ---------------------------------------------------
+    def run_rank0(self, sock, sched, n_pre, log):
+        cum, pos = [], 0
+        for s in sched:
+            pos += s
+            cum.append(pos)
+        ok = (self.eligible
+              and len(self.chunks) == len(sched)
+              and [c[2] for c in self.chunks] == cum
+              and pos == n_pre)
+        if not ok:
+            log(f"[prime] 생략: eligible={self.eligible} chunks={len(self.chunks)} "
+                f"sched={len(sched)}")
+        cap = self.stage.prime_max_bytes
+        if ok and cap and self.n_bytes > cap:
+            log(f"[prime] hidden {self.n_bytes / 2**30:.2f}GiB > 상한 "
+                f"{cap / 2**30:.2f}GiB — 이번 요청 프라이밍 생략")
+            ok = False
+        # 접을지 말지는 **rank0 이 정하고 프레임으로 통보**한다 — 양 랭크가 각자
+        # 술어를 평가하면 드리프트 한 번에 fold 횟수가 갈려 영구 교착이 된다.
+        send_json(sock, {"op": "prime", "fold": bool(ok), "n": len(sched),
+                         "offsets": cum})
+        if not ok:
+            self.chunks.clear()
+            self._expect_ack(sock)
+            return 0
+        t0 = time.perf_counter()
+        tx = 0
+        for i, (ids, h, off) in enumerate(self.chunks):
+            tx += send_prepared(sock, "ph", prepare_tensor(h), i=i)
+            self._fold(ids, h, off)
+        self.chunks.clear()          # hidden 즉시 해제
+        mx.clear_cache()
+        self._expect_ack(sock)
+        log(f"[prime] fold {self.n_fold}청크 "
+            f"{(time.perf_counter() - t0) * 1e3:.0f}ms (tx {tx / 1e6:.0f}MB)")
+        return self.n_fold
+
+    def _expect_ack(self, sock):
+        kind, *rest = recv_msg(sock)
+        if kind != "json" or rest[0].get("op") != "prime_ack":
+            raise WireError(f"expected prime_ack, got {kind}/{rest[0] if rest else ''}")
+
+    # -- rank1 종속 ------------------------------------------------------
+    def run_rank1(self, sock, msg, tokens, sched, n_pre, log):
+        cum, pos = [], 0
+        for s in sched:
+            pos += s
+            cum.append(pos)
+        if int(msg.get("n", -1)) != len(sched) or msg.get("offsets") != cum:
+            raise WireError(
+                f"prime 매니페스트 불일치: n={msg.get('n')} vs {len(sched)}")
+        if not msg.get("fold"):
+            send_json(sock, {"op": "prime_ack", "folded": 0})
+            return 0
+        toks = mx.array(np.asarray(tokens, dtype=np.int32))[None]
+        pos = 0
+        for i, n in enumerate(sched):
+            m = recv_msg(sock)
+            if m[0] != "tensor" or int(m[1].get("i", -1)) != i:
+                raise WireError(f"prime hidden {i} 프레임 이상: {m[0]}/{m[1]}")
+            meta, raw = m[1], m[2]
+            h = to_mx(meta, raw)
+            mx.eval(h)
+            self._fold(toks[:, pos:pos + n], h, cum[i])
+            h = None
+            pos += n
+        mx.clear_cache()
+        send_json(sock, {"op": "prime_ack", "folded": self.n_fold})
+        return self.n_fold
+
+
 class _Client(PP2Client):
     """PP2Client 의 청크 파이프라인만 재사용(소켓/모델은 외부 주입)."""
 
@@ -185,7 +390,8 @@ class Pp2Stage:
     """양 랭크에서 **대칭적으로** 생성·호출되는 PP2 프리필 스테이지."""
 
     def __init__(self, rank, model_tp, model_path, *, split=22, chunk=2048,
-                 port=39935, server_ip="10.0.0.2", min_tokens=4096, log=print):
+                 port=39935, server_ip="10.0.0.2", min_tokens=4096,
+                 priming=False, prime_max_bytes=4 << 30, log=print):
         self.rank = rank
         self.model_tp = model_tp
         self.model_path = model_path
@@ -194,6 +400,8 @@ class Pp2Stage:
         self.port = port
         self.server_ip = server_ip
         self.min_tokens = min_tokens
+        self.priming = priming
+        self.prime_max_bytes = prime_max_bytes
         self.log = log
         self.n_layers = len(model_tp.model.layers)
         self.model_pp = None
@@ -257,11 +465,18 @@ class Pp2Stage:
         """
         ids = list(ids)
         pre = ids[:-1]
+        sched = make_schedule(len(pre), self.chunk)
+        fold = _PrimeFold(self) if self.priming else None
         t0 = time.perf_counter()
         if self.rank == 0:
             cli = _Client(self.model_pp, self.sock, self.split, self.n_layers)
-            _lg, pst = cli.prefill(pre, self.chunk, k=1, on_seam=on_seam)
+            _lg, pst = cli.prefill(pre, self.chunk, k=1, on_seam=on_seam,
+                                   tap=(fold.tap if fold is not None else None))
             t_pf = time.perf_counter() - t0
+            if fold is not None:
+                # 이음새 콜백이 **모두 끝난 뒤** 접는다 — 이음새가 돌리는 다른 요청의
+                # 프리필이 우리 fold 사이에 끼면 청크 순서·ctx 가 뒤엉킨다.
+                fold.run_rank0(self.sock, sched, len(pre), self.log)
             th = time.perf_counter()
             send_json(self.sock, {"op": "fetch_cache"})
             layers, arrays, rx = recv_cache(self.sock, "cache_manifest")
@@ -312,7 +527,7 @@ class Pp2Stage:
                 send_json(self.sock, {"op": "push_ack"})
 
             t_r1b = time.perf_counter()
-            self._serve_ops(sl, on_push, on_seam=on_seam)
+            self._serve_ops(sl, on_push, on_seam=on_seam, fold=fold)
             t_r1c = time.perf_counter()
             if self.trace:
                 _s0 = time.perf_counter(); mx.synchronize()
@@ -336,10 +551,17 @@ class Pp2Stage:
         if bad:
             raise RuntimeError(f"[pp2] 조립 캐시 offset 불일치 층 {bad[:5]} "
                                f"(기대 {len(pre)})")
+        if fold is not None:
+            # 설치는 **맨 마지막**에 — 여기부터 활성화(`take_primed`)까지는 forward 가
+            # 없어 다른 요청의 캡처가 슬롯을 덮을 창이 없다. 양 랭크 동일 시점.
+            n = fold.install(len(pre), self.log)
+            if self.rank == 0:
+                self.log(f"[prime] 설치 {n}페어 (프롬프트 {len(ids)} tok)")
         self.n_calls += 1
         return full
 
-    def _serve_ops(self, sl, on_push, on_seam=None):
+    def _serve_ops(self, sl, on_push, on_seam=None, fold=None):
+        last = {}
         while True:
             kind, *rest = recv_msg_warm(self.sock)
             if kind != "json":
@@ -347,7 +569,20 @@ class Pp2Stage:
             msg = rest[0]
             op = msg.get("op")
             if op == "prefill":
+                last = {"tokens": [int(t) for t in msg["tokens"]],
+                        "schedule": list(msg["schedule"])}
                 _do_prefill(self.sock, sl, msg, on_seam=on_seam)
+            elif op == "prime":
+                if fold is None:
+                    # 게이트가 랭크마다 다르게 켜졌다 = fold 횟수 비대칭 =
+                    # 집합연산 영구 교착. 조용히 넘기지 말고 크게 죽는다.
+                    raise WireError(
+                        "prime 프레임 도착했으나 랭크1 프라이밍 게이트가 꺼짐 — "
+                        "DSV4_PP2_PRIMING 이 양 랭크에 같게 걸렸는지 확인")
+                if not last:
+                    raise WireError("prime 이 prefill 보다 먼저 도착 — 프로토콜 파손")
+                fold.run_rank1(self.sock, msg, last["tokens"], last["schedule"],
+                               sum(last["schedule"]), self.log)
             elif op == "fetch_cache":
                 n = send_cache(self.sock, sl.cache, "cache_manifest")
                 send_json(self.sock, {"op": "cache_done", "bytes_total": n})
@@ -380,5 +615,12 @@ def from_env(rank, model_tp, model_path, log=print):
         port=int(os.environ.get("DSV4_PP2_PORT", "39935")),
         server_ip=os.environ.get("DSV4_PP2_SERVER_IP", "10.0.0.2"),
         min_tokens=int(os.environ.get("DSV4_PP2_MIN_TOKENS", "4096")),
+        # MTP 프롬프트 프라이밍 복원(기본 off = 종전 unprimed 폴백 경로 그대로).
+        # 양 랭크에 **반드시 같은 값**으로 걸려야 한다 — serve_b_pp2.sh 는 리터럴
+        # export 라 자동 보장되고, 어긋나면 `_serve_ops` 가 즉시 죽는다.
+        priming=os.environ.get("DSV4_PP2_PRIMING", "0").strip().lower()
+        not in ("0", "", "false", "off"),
+        prime_max_bytes=int(
+            float(os.environ.get("DSV4_PP2_PRIME_MAX_GIB", "8")) * (1 << 30)),
         log=log,
     ).setup()

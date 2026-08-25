@@ -31,9 +31,25 @@ export DSV4_PP2_SPLIT=22
 export DSV4_PP2_CHUNK=2048
 export DSV4_PP2_PORT=39935
 export DSV4_PP2_SERVER_IP=10.0.0.2
-# Short requests keep the legacy path, which preserves MTP prompt priming
-# (the PP2 path inserts unprimed and falls back).
+# Short requests keep the legacy path, whose BatchGenerator prefill picks up MTP
+# prompt-priming capture for free.
 export DSV4_PP2_MIN_TOKENS=4096
+# MTP prompt priming on the PP2 path: rank0 ships each prefill chunk's trunk-final
+# hidden to rank1 and BOTH ranks fold the (hidden, next-token) pairs through
+# prompt_priming.maybe_capture, so take_primed sees a real context instead of the
+# unprimed fallback. Implemented and verified (primed=14045 on a 13.9K prompt —
+# the same context the non-PP2 path builds natively) but shipped OFF: measured
+# 2026-08-26 at -1.1% tok/cycle on a 512-token decode and -0.7% on 128, i.e.
+# nothing outside the +/-4% three-sample noise band, and the same neutral result
+# reproduces on the non-PP2 path (-1.2% / +3.9%). The reason is structural: this
+# model's MTP head is a RotatingKVCache(max_size=sliding_window=128) masked to a
+# 128-token window, so priming can hand it at most the last 128 prompt tokens and
+# those are fully evicted within 128 generated tokens. It also costs ~0.33s TTFT
+# (460MB extra TB5 transfer + one MTP-block forward per rank) and perturbs draft
+# shapes enough to change output text through GEMM K-split float drift. Flip to 1
+# only if the head ever gets a wider attention span. Both ranks must agree —
+# pp2_prefill_stage dies loudly on a mismatch rather than deadlocking.
+export DSV4_PP2_PRIMING=0
 # wired killswitch sidecar: mandatory here — the co-resident PP2 slice roughly
 # doubles resident memory (~145GB/box).
 ( while true; do sleep 5
