@@ -42,7 +42,7 @@
   <g font-family="Menlo, SFMono-Regular, Consolas, monospace">
     <text x="430" y="128" font-size="56" font-weight="bold" fill="#EFF5F1" letter-spacing="-1">two-macstudio-<tspan fill="#E8A33D">m3u</tspan></text>
     <text x="432" y="174" font-size="18" fill="#A8BDB2">reproducible MoE LLM serving &#183; 2&#215; Mac Studio M3 Ultra &#183; TB5 &#183; MLX</text>
-    <text x="432" y="220" font-size="17" fill="#6F8579">prefill 895 tok/s &#183; decode 45&#8211;47 tok/s &#183; bit-exact pipeline prefill</text>
+    <text x="432" y="220" font-size="17" fill="#6F8579">prefill 1012 tok/s &#183; decode 45&#8211;47 tok/s &#183; bit-exact pipeline prefill</text>
   </g>
 
   <!-- copyright -->

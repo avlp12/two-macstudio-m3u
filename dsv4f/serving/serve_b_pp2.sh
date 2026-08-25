@@ -21,6 +21,12 @@ fi
 # only and give you a silently asymmetric two-rank config.
 # The OFF control arm is the untouched serve_b.sh, not this file with the gate off.
 export DSV4_PP2_PREFILL=1
+# HOL interleave + snapshot-store integration, promoted to on-by-default 2026-08-26:
+# free when nothing else is running; under contention, concurrent short-request TTFT
+# drops 16.2s -> 2.7s at a +5.8% cost on the long prefill (refunded to everyone else).
+# Roll back by setting both to 0.
+export DSV4_PP2_INTERLEAVE=1
+export DSV4_PP2_SNAPSTORE=1
 export DSV4_PP2_SPLIT=22
 export DSV4_PP2_CHUNK=2048
 export DSV4_PP2_PORT=39935

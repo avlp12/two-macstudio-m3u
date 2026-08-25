@@ -197,19 +197,21 @@ prefix-snapshot cache for multi-turn reuse.
 
 | | `serve_b.sh` (default) | `serve_b_pp2.sh` (PP2 prefill) |
 |---|---|---|
-| Prefill @13.9K, e2e | 544 tok/s, TTFT 25.5 s | **895 tok/s, TTFT 15.5 s (1.64×)** |
+| Prefill @13.9K, e2e | 544 tok/s, TTFT 25.5 s | **1012 tok/s, TTFT 13.79 s (1.86×)** |
 | Decode | unchanged | unchanged |
 | How prefill runs | TP2 tensor-parallel through `BatchGenerator` | layer-split 2-stage pipeline (raw chunk loop, no collectives), KV handed back to the TP2 layout |
 | Applies to | every request | only requests ≥ `DSV4_PP2_MIN_TOKENS` (4096); shorter requests keep the legacy path |
-| Prefix-snapshot cache | yes | **no** for PP2-inserted prompts — they skip the snapshot store, so you lose multi-turn TTFT reuse on long prompts |
+| Prefix-snapshot cache | yes | **yes**, as of 2026-08-26 (`DSV4_PP2_SNAPSTORE=1`, default on) — same 13.9K prompt re-requested: TTFT 13.70 s → 0.107 s |
+| Concurrent-traffic fairness | n/a (single path) | **fixed** as of 2026-08-26 (`DSV4_PP2_INTERLEAVE=1`, default on) — a 13.9K PP2 prefill no longer freezes other traffic for its full duration; concurrent short-request TTFT p50 16.2 s → 2.7 s at +5.8% cost on the long prefill (free when uncontended) |
 | MTP prompt priming | yes | **no** on the PP2 path — those prompts insert unprimed and fall back (this is why short requests are routed around it) |
 | Resident memory | ~72 GB/box | **~145 GB/box** (the PP2 slice is co-resident) — the wired killswitch sidecar is mandatory |
 | Output | — | byte-identical long-form response vs. the OFF arm; identical MTP telemetry |
 
-Rule of thumb: PP2 is a straight win for long-prompt, low-multi-turn workloads (document
-Q&A, agentic long-context reads). If your traffic is chatty multi-turn with long shared
-prefixes, the snapshot cache the legacy path keeps (95% reuse, TTFT −45–61%) may be worth
-more than 1.64× on the cold prefill. Measure your own mix; both launchers are here.
+Rule of thumb: as of 2026-08-26, PP2 carries the same prefix-snapshot reuse as the legacy
+path and no longer stalls concurrent traffic during a long prefill, so it is close to a
+straight win across the board. The remaining reasons to prefer the legacy path: it keeps
+MTP prompt priming (PP2 prompts insert unprimed), and its resident footprint is roughly
+half. Measure your own mix; both launchers are here.
 
 **Chunk size is fixed at 2048 and is not output-invariant.** `DSV4_PP2_CHUNK=1024` is
 measurably faster raw (1030 vs 992 tok/s) but produces *different argmax output* — the same
@@ -266,13 +268,14 @@ launch is a jaccl-mesh wedge risk, so minimize launches.
 > pathological (it was not — 1–3% apart). Compare like-for-like or the numbers are noise.
 > Also: `--long-doc 60` is ~2,120 tokens, **not** 13.9K. 13.9K is `--long-doc 397`.
 
-### 5c. Serving-path prefill A/B (the 895 number)
+### 5c. Serving-path prefill A/B (the 1012 number)
 
 Start with `serve_b.sh`, send a 13.9K-token prompt, record TTFT and e2e prefill tok/s from
 the server log. Shut down cleanly. Start with `serve_b_pp2.sh`, send the **identical**
-prompt, compare. You should see 544 → 895 tok/s, TTFT 25.5 → 15.5 s, and a byte-identical
-response. The PP2 stage itself runs at ~985 tok/s; the KV handover back to the serving
-layout costs 126 ms (0.5% of TTFT).
+prompt, compare. You should see 544 → 1012 tok/s, TTFT 25.5 → 13.79 s, and a byte-identical
+response. The PP2 stage itself runs at ~1030–1044 tok/s (the e2e-vs-stage gap is 1.8%,
+after the GPU-residency and warm-up fixes described in `local-llm-serving`'s README); the
+KV handover back to the serving layout costs 126 ms.
 
 ### 5d. Decode and MTP telemetry
 

@@ -7,6 +7,13 @@ Numbers measured on our cluster, for you to compare your own run against. Hardwa
 `mlx-community/DeepSeek-V4-Flash-4bit` with the MTP block restored and the round-6c aligned
 head. Dates in parentheses are the measurement date.
 
+**mlx build note:** stock `mlx==0.32.0` is a fully verified reproduction baseline — every
+number below was reproducible on it. Production also runs an optional cherry-pick wheel
+(`cherry/v0.32.0-dsv4`, stock 0.32.0 + a 10-commit accuracy/stability backport) with
+byte-identical output and parity-to-slightly-ahead throughput; see
+[`avlp12/local-llm-serving`](https://github.com/avlp12/local-llm-serving) for that build. You
+do not need it to reproduce anything here.
+
 If your numbers are within a few percent, you have reproduced it. If they are 30% off,
 check the two things in [§6](#6-before-you-conclude-anything-is-broken) first.
 
@@ -55,12 +62,33 @@ see [§6](#6-before-you-conclude-anything-is-broken).
 | TP2 jaccl, E1 matched | **574.2–575.1** | **1.44×** true scaling vs the matched 1-box baseline |
 | TP2 `ring`, raw chunk loop | 519.6 | ring is *slower* than one box — use jaccl |
 | **TP2 serving e2e (`serve_b.sh`)** | **544** | TTFT 25.52 s (ledger range 544–558) |
-| **PP2 serving e2e (`serve_b_pp2.sh`)** | **895** | TTFT **15.52 s** = **1.64×**, byte-identical output |
-| PP2 stage alone (in the serving process) | 985 | KV handover back to TP2 layout: 126 ms (0.5% of TTFT) |
-| PP2 raw, split 22, chunk 2048 | 992.3 | **1.639×** of 1-box raw |
+| **PP2 serving e2e (`serve_b_pp2.sh`)** | **1012** | TTFT **13.79 s** = **1.86×** vs the 544 baseline, byte-identical output |
+| PP2 stage alone (in the serving process, `t_prefill`) | 1030–1044 | **1.70×** vs 1-box raw 605.4, bit-exact; e2e-vs-stage gap now **1.8%** (was 8.7% before the GPU-residency + warm-up fixes below) |
+| PP2 raw, split 22, chunk 2048 | 992.3 | **1.639×** of 1-box raw (standalone harness, pre-integration) |
 | PP2 raw, split 22, chunk 1024 | 1030.5 | 1.702× — but **different argmax output**, do not ship |
 
-(2026-08-25.)
+(2026-08-25; PP2 serving e2e and stage rows updated 2026-08-26 after the GPU keep-alive/
+warm-up fixes and the HOL-interleave + snapshot-store integration below closed the
+e2e-vs-stage gap.)
+
+### Multi-user fairness (HOL interleave) and snapshot reuse on PP2
+
+Two gates, both on by default in `serve_b_pp2.sh` as of 2026-08-26 (`DSV4_PP2_INTERLEAVE=1`,
+`DSV4_PP2_SNAPSTORE=1`), numerically inert either way:
+
+| Scenario | Gates off | Gates on |
+|---|---|---|
+| Short-request TTFT, p50, under a concurrent 13.9K PP2 prefill | 16.19 s | **2.73 s** |
+| Live decode session, max stall under the same load | 14.17 s | **3.36 s** |
+| Long-prompt (13.9K) prefill cost | 13.35 s / 1045 tok/s | 14.12 s / 988 tok/s (**+5.8%**) |
+| Long-prompt prefill, uncontended (nothing else running) | 13.35 s / 1045 tok/s | 13.37 s / 1044 tok/s (**free**) |
+| Repeat request, same 13.9K prompt (snapshot hit) | 13.70 s TTFT | **0.107 s TTFT (−99.2%)** |
+| Response text, all arms | — | byte-identical to gates-off |
+
+The interleave cost is entirely the interleaved decode work itself, paid by the long
+request and refunded to everyone else — it is not a barrier/locking penalty. Before this
+gate, prefix-snapshot reuse did not apply to PP2-inserted prompts at all (see §5); it now
+does.
 
 Chunk-size sweep, TP2, same prompt: **2048 = 426 @4096 (−26%) = 339 @8192 (−41%)**. Bigger
 chunks are worse, not better. 2048 is a sharp peak, not a plateau.
@@ -164,8 +192,10 @@ loaded on one rank only.
 | Multi-turn reuse rate | 95% |
 | TTFT reduction, multi-turn | −45 – 61% |
 | Quality cost | none — greedy-exact |
+| PP2 prompts (`DSV4_PP2_SNAPSTORE=1`, default on since 2026-08-26) | included — same 13.9K prompt re-requested: TTFT 13.70 s → **0.107 s (−99.2%)** |
 
-Not available on the PP2 path (PP2-inserted prompts skip the snapshot store).
+Before the 2026-08-26 snapshot-store integration, PP2-inserted prompts skipped the
+snapshot store entirely; see §2's HOL/snapshot table for the A/B.
 
 Memory: **≈145 GB/box resident under `serve_b_pp2.sh`**, roughly double the non-PP2
 resident set, because the PP2 slice is co-resident with the TP2 shard. A clean shutdown
