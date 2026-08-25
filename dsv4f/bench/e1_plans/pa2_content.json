@@ -1,0 +1,12 @@
+[
+  {"mode": "timing", "source": "repeat", "label": "13.9K_repeat", "n_repeat": 397, "chunk": 2048,
+   "warmup": true, "reps": 2, "max_tokens": 8, "tag": "pa2_repeat_13_9k"},
+  {"mode": "timing", "source": "file", "label": "13.9K_file", "file": "REPLACE_ME_HOME/dsv4flash/align/onpolicy_c.txt",
+   "target_tokens": 13897, "chunk": 2048, "warmup": true, "reps": 2, "max_tokens": 8,
+   "tag": "pa2_file_13_9k", "sleep_before_s": 5},
+  {"mode": "timing", "source": "repeat", "label": "17.2K_repeat", "n_repeat": 491, "chunk": 2048,
+   "warmup": true, "reps": 2, "max_tokens": 8, "tag": "pa2_repeat_17_2k", "sleep_before_s": 5},
+  {"mode": "timing", "source": "file", "label": "17.2K_file", "file": "REPLACE_ME_HOME/dsv4flash/align/onpolicy_c.txt",
+   "target_tokens": 17193, "chunk": 2048, "warmup": true, "reps": 2, "max_tokens": 8,
+   "tag": "pa2_file_17_2k", "sleep_before_s": 5}
+]

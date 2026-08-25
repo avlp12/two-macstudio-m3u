@@ -1,0 +1,4 @@
+[
+  {"mode": "timing", "label": "3.5K", "n_repeat": 100, "chunk": 2048, "reps": 2, "warmup": true, "max_tokens": 8, "tag": "spike_tp2_3_5k_c2048"},
+  {"mode": "timing", "label": "7K", "n_repeat": 200, "chunk": 2048, "reps": 2, "warmup": true, "max_tokens": 8, "tag": "spike_tp2_7k_c2048"}
+]

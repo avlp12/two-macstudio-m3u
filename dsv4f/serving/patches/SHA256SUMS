@@ -1,0 +1,3 @@
+f92094a6e1aa0b3e5d0e326e698ddfd898be23d3b21f8730e06704a310e9df23  omlx/patches/deepseek_v4/deepseek_v4_model.py
+d4246d958a755b853c2453102204a03d1480d924b7636432fe3e4e58cdd706bc  omlx/patches/mlx_lm_mtp/batch_generator.py
+aae7c8baf2caf4afcc1f40c568d33560e1c6e1a5b9c86a5e3f06a12b4bfab574  omlx/patches/mlx_lm_mtp/prompt_priming.py

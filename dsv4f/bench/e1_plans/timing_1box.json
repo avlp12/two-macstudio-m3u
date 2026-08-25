@@ -1,0 +1,3 @@
+[
+  {"mode": "timing", "label": "13.9K", "n_repeat": 397, "chunk": 2048, "reps": 2, "warmup": true, "max_tokens": 8, "tag": "1box_13_9k_c2048"}
+]

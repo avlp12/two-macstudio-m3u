@@ -1,0 +1,5 @@
+[
+  {"mode": "needle", "label": "13.9K", "n_repeat": 397, "chunk": 2048, "secret_code": "8317", "needle_frac": 0.5, "max_tokens": 96, "tag": "needle_13_9k"},
+  {"mode": "needle", "label": "1.8K",  "n_repeat": 51,  "chunk": 2048, "secret_code": "4290", "needle_frac": 0.5, "max_tokens": 96, "tag": "needle_1_8k"},
+  {"mode": "needle", "label": "2.2K",  "n_repeat": 62,  "chunk": 2048, "secret_code": "6055", "needle_frac": 0.5, "max_tokens": 96, "tag": "needle_2_2k"}
+]

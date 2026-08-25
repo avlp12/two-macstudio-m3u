@@ -1,0 +1,36 @@
+{
+ "backend": "jaccl-ring",
+ "envs": [
+  "MLX_METAL_FAST_SYNCH=1"
+ ],
+ "hosts": [
+  {
+   "ssh": "127.0.0.1",
+   "ips": [
+    "10.0.0.1"
+   ],
+   "rdma": [
+    null,
+    [
+     "rdma_en4",
+     "rdma_en5",
+     "rdma_en3"
+    ]
+   ]
+  },
+  {
+   "ssh": "BOX_B_USER@10.0.0.2",
+   "ips": [
+    "10.0.0.2"
+   ],
+   "rdma": [
+    [
+     "rdma_en4",
+     "rdma_en5",
+     "rdma_en3"
+    ],
+    null
+   ]
+  }
+ ]
+}
