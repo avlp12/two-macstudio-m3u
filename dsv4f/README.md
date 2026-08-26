@@ -251,6 +251,27 @@ heights across tracks**. Intervals where prefill and decode actually overlapped 
 grey; with `DSV4_PP2_INTERLEAVE=1` that overlap is the normal steady state, because the HOL
 interleave runs live batch-decode steps at every 2048-token prefill seam.
 
+What it looks like — live tab (a 13.9K PP2 prefill finishing while 8 other streams decode)
+and accumulating tab (two server boots, with the restart boundary marked):
+
+| ![live dashboard](../assets/dash_example_live.png) |
+|---|
+| ![accumulating dashboard](../assets/dash_example_history.png) |
+
+**These two images are illustrative.** They are rendered by the real dashboard code, but the
+traffic is a scripted replay (`serving/dash_demo_replay.py`, runs offline — no GPU, no
+serving process) built from the measured constants in
+[EXPECTED_RESULTS.md](EXPECTED_RESULTS.md); our own recorded validation traffic was only 71 s
+long and fills a 5-minute window too sparsely to show the shape. The pages carry a
+`DEMO REPLAY` marker in the footer for that reason. The replay server is also the easiest way
+to see the dashboard before you have the model running.
+
+One rendering caveat worth knowing: the chart canvas sets its backing-store width from
+`devicePixelRatio` but not its height, so on a Retina display (or any capture at
+`--force-device-scale-factor=2`) the plot area collapses to `1/dpr` of its intended height and
+the decode track can disappear entirely. Screenshots here were taken at `deviceScaleFactor=1`
+with a 2×-sized viewport to work around it.
+
 Instrumentation is a `deque` append plus a `perf_counter()` read. No `mx` op is added to any
 measured path, so nothing forces a lazy graph to fold early and distort the wall clock.
 Event sources:
