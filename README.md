@@ -114,7 +114,18 @@ sudo ifconfig bridge0 deletem en4
 
 `ifconfig` assignments do not survive a reboot. `cluster/tbnet-restore.sh` +
 `cluster/com.alis.tbnet.plist` is a launchd daemon that reasserts them, retrying for two
-minutes while the interfaces come up:
+minutes while the interfaces come up.
+
+**Do not hardcode the interface.** Our first version pinned the address to `en4`. When a
+Thunderbolt re-enumeration moved the cable to `en5`, the daemon dutifully assigned the
+cluster IP to a port with no carrier — and macOS silently fell back to a USB-NCM link at
+100baseTX. Nothing errored. Collectives ran **220x slower** (16 MiB all_sum: 790 ms vs
+5.4 ms) and every measurement taken in that window was garbage. The script now picks a
+port that has carrier *and* answers from the peer, and skips `bridge0` members so it can
+never steal a link to a third machine. `cluster/tb_preflight.sh` is the matching
+pre-launch check: it fails loudly if the peer is unreachable or throughput is below a
+floor, which is the only automatic way to tell a healthy Thunderbolt link from the
+USB-NCM fallback.
 
 ```bash
 sudo cp cluster/tbnet-restore.sh /Users/Shared/tbnet-restore.sh
