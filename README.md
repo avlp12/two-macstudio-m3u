@@ -80,7 +80,9 @@ en3 <-> en3   10.0.2.1 / 10.0.2.2    extra, on demand
 ```
 
 Your `enX` numbering will differ. `networksetup -listallhardwareports` maps Thunderbolt
-ports to interface names; `TBNET_LINKS` in `cluster/tbnet-restore.sh` overrides the pairs.
+ports to interface names — but **do not rely on that mapping being stable**: a Thunderbolt
+re-enumeration renames ports, which is exactly how we lost a link (§2.3). The daemon probes
+candidates instead; `TBNET_CAND` overrides the candidate list.
 
 ---
 
@@ -129,7 +131,7 @@ USB-NCM fallback.
 
 ```bash
 sudo cp cluster/tbnet-restore.sh /Users/Shared/tbnet-restore.sh
-echo 1 | sudo tee /Users/Shared/tbnet-octet          # "1" on box A, "2" on box B
+# box identity comes from the local hostname; no octet file needed
 sudo cp cluster/com.alis.tbnet.plist /Library/LaunchDaemons/com.alis.tbnet.plist
 sudo launchctl load /Library/LaunchDaemons/com.alis.tbnet.plist
 ```
