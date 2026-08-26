@@ -17,6 +17,15 @@
 #   3) 피어 미확인 때 tbnet-iface 를 안 남겨 tb_sync_hostfile 이 근거를 잃음.
 #      캐리어 있는 비-브리지 포트가 있으면 기록하고 status=peer-unconfirmed.
 #
+# 2026-08-26 심야 (26.6.2 승급 후) v3: 네 번째 결함.
+#   4) preferences.plist 의 __AUTO__=thunderbolt-bridge 가 **서비스 비활성과 무관하게**
+#      부팅마다 모든 TB 포트를 bridge0 에 L2 편입시킨다(OS 소행 — v2 가 규칙을 지키자
+#      비로소 드러남). 비-브리지 후보가 0 이 되어 v2 는 굶었다.
+#      → 비-브리지 후보가 0 이면 우란(en2)을 뺀 브리지 멤버를 **한 포트씩
+#        회수(deletem)해 피어를 시험하고, 실패하면 즉시 원복**한다.
+#        시험 순서는 지난 부팅 포트(tbnet-iface) 먼저. 최종 실패 시에도 한 포트를
+#        회수 상태로 유지해 IP 를 걸어 둔다 — 늦게 뜬 반대편이 확인하면 성립한다.
+#
 # bridge0 멤버 중 우란(en2, 192.168.7.x)은 건드리지 않는다.
 
 case "$(scutil --get LocalHostName 2>/dev/null)" in
@@ -93,6 +102,35 @@ _bind_cluster() {
   _align_route "$ifc"
 }
 
+# __AUTO__ thunderbolt-bridge 가 모든 포트를 물고 있을 때: 우란을 뺀 브리지 멤버를
+# 하나 회수해 피어를 시험한다. 실패하면 IP 를 벗기고 브리지에 원복한다.
+_evict_probe() {
+  local ifc="$1"
+  _exists "$ifc" || return 1
+  _is_uran "$ifc" && return 1
+  _bridged "$ifc" || return 1
+  _active "$ifc" || return 1
+  if [ "$DRY" = 1 ]; then
+    echo "[tbnet-dry] would evict $ifc from bridge0 and probe $PEER_IP"
+    return 1
+  fi
+  ifconfig bridge0 deletem "$ifc" 2>/dev/null
+  _bind_cluster "$ifc"
+  sleep 1
+  if ping -c 1 -t 2 "$PEER_IP" >/dev/null 2>&1; then
+    logger "tbnet-restore: $ifc 를 bridge0 에서 회수 (피어 확인)"
+    return 0
+  fi
+  ifconfig "$ifc" inet "$SELF_IP" -alias 2>/dev/null
+  ifconfig bridge0 addm "$ifc" 2>/dev/null
+  return 1
+}
+
+# 회수 시험 순서: 지난 부팅에 기록된 포트(tbnet-iface) 먼저, 그다음 CAND 순서. 중복 제거.
+_evict_order() {
+  { cat "$IFACE_FILE" 2>/dev/null; printf '%s\n' $CAND; } | awk 'NF && !seen[$0]++'
+}
+
 _write_iface() {
   local ifc="$1" st="$2"
   if [ "$DRY" = 1 ]; then
@@ -116,6 +154,7 @@ if [ "$DRY" = 1 ]; then
   done
   hope=$(_first_cluster_cand || true)
   echo "[tbnet-dry] first cluster candidate: ${hope:-none}"
+  echo "[tbnet-dry] evict order (when no clean candidate): $(_evict_order | tr '\n' ' ')"
   echo "[tbnet-dry] if chosen empty: will NOT addm to bridge0"
   exit 0
 fi
@@ -135,8 +174,17 @@ for tries in $(seq 24); do
   # 브리지에는 아직 넣지 않는다.
   if [ -z "$chosen" ]; then
     hope=$(_first_cluster_cand || true)
-    [ -n "$hope" ] && _bind_cluster "$hope"
+    if [ -n "$hope" ]; then
+      _bind_cluster "$hope"
+    else
+      # 비-브리지 후보 0 — __AUTO__ thunderbolt-bridge 가 전부 편입한 상태(결함 4).
+      # 우란을 뺀 멤버를 한 포트씩 회수 시험한다(실패 시 _evict_probe 가 즉시 원복).
+      for evict in $(_evict_order); do
+        _evict_probe "$evict" && { chosen="$evict"; break; }
+      done
+    fi
   fi
+  [ -n "$chosen" ] && break
   sleep 5
 done
 
@@ -179,7 +227,25 @@ else
     _write_iface "$hope" "peer-unconfirmed"
     logger "tbnet-restore: 피어 미확인 — $SELF_IP on $hope (tbnet-iface 기록, 브리지 추가 없음)"
   else
-    act=$(for i in $CAND; do _active "$i" && ! _bridged "$i" && ! _is_uran "$i" && printf "%s " "$i"; done)
-    logger "tbnet-restore: 피어 미확인 — 활성 비-브리지 클러스터 후보[$act]. jaccl 호스트파일의 rdma_enX 확인 필요"
+    # 깨끗한 후보가 없으면(전 포트 브리지 편입) 한 포트를 회수 상태로 유지하며 대기.
+    # 원복하지 않는 것이 핵심 — 반대편이 나중에 떠서 이 IP 를 확인하면 링크가 성립한다.
+    held=""
+    for evict in $(_evict_order); do
+      _exists "$evict" || continue
+      _is_uran "$evict" && continue
+      _bridged "$evict" || continue
+      _active "$evict" || continue
+      ifconfig bridge0 deletem "$evict" 2>/dev/null
+      _bind_cluster "$evict"
+      held="$evict"
+      break
+    done
+    if [ -n "$held" ]; then
+      _write_iface "$held" "peer-unconfirmed"
+      logger "tbnet-restore: 피어 미확인 — $held 를 브리지에서 회수해 $SELF_IP 대기 (반대편 확인 시 성립)"
+    else
+      act=$(for i in $CAND; do _active "$i" && ! _bridged "$i" && ! _is_uran "$i" && printf "%s " "$i"; done)
+      logger "tbnet-restore: 피어 미확인 — 활성 비-브리지 클러스터 후보[$act]. jaccl 호스트파일의 rdma_enX 확인 필요"
+    fi
   fi
 fi
