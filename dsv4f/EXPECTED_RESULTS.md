@@ -171,6 +171,21 @@ this — included because it is what we measured first and it is directionally c
 | round 2 | 76.5% | 57.1% | 23.0% | 2.312 |
 | round 6c | 74.1% | 60.9% | 31.0% | 2.346 (+1.5%) |
 
+**Recirculation** (default on since 2026-08-26, `OMLX_MTP_RECIRC_ALPHA2/3=0.20` in
+`serve_b_pp2.sh`): blends the backbone hidden into the depth-2/3 draft chain. 24-topic
+paired bs1, on top of round 6c:
+
+| | depth-1 | depth-2 | depth-3 | tok/cycle | sign test |
+|---|---|---|---|---|---|
+| 6c, recirc off | 79.3% | 61.3% | 34.3% | 2.459 | — |
+| **6c + recirc (production)** | 78.3% | 62.6% | **41.2%** | **+1.01%** | 14W-9L-1T, p ≈ 0.40 |
+
+Individually below significance, but: measured in both launch orders (OFF→ON and ON→OFF)
+with **bit-identical** per-topic token hashes and tok/cycle both times, mechanism-consistent
+(the gain concentrates exactly at depth-3, +7 pp), and zero measured cost (MTP ms/cycle no
+higher on, no memory delta). Free levers get harvested. Live serving with it on: tok/cycle
+2.46–2.70, no TTFT or decode regression.
+
 **Live serving probe** during the PP2 A/B, 13.9K prompt: d1 73.3%, tok/cycle 2.60 —
 identical on both arms, i.e. the PP2 path's loss of prompt priming cost nothing on that
 probe.
@@ -220,7 +235,8 @@ Other things that will move your numbers, all measured:
 - Thermal drift across a long sweep: **−2.4 – 2.6%** (measured A/B/A). Not enough to explain a large gap, enough to matter at the margin. Also: benchmarking immediately after idle reads ~2.8% low.
 - `mx.set_wired_limit(...)` — if you write your own harness and forget it, a >100 GB model thrashes and you will measure something like 0.27 tok/s instead of 22.9. `mlx_lm`'s high-level wrappers set it; calling `generate_step` directly does not.
 - Forgetting `mx.eval` in a microbenchmark produces impossible numbers (we once "measured" 437 TFLOPS).
-- **Stochastic wedges are real.** On our worst day: 3 transient Metal errors and 2 collective wedges in ~12 hours of heavy two-box work, all recovered by relaunch or reboot, all on unchanged code. Two of the wedges landed on the first topic of a bs1 sweep that had completed cleanly twice before. Budget for it; make long jobs resumable; never store measurements in `/tmp`.
+- **Stochastic wedges are real — and now audited.** On our worst day: 3 transient Metal errors and 2 collective wedges in ~12 hours of heavy two-box work (5 wedges total across the campaign, one on the `--batch` path with MTP off), all recovered by relaunch or reboot, all on unchanged code. A first-principles source audit (2026-08-26) traced the plausible mechanism to the `MLX_METAL_FAST_SYNCH=1` fence layer discarding command-buffer errors — the fast-path completion handler never checks status, so a failed buffer spins forever instead of raising (an alternative self-sufficient hypothesis: the CPU fence-wait spin occupying the single stream thread that must service the reverse-direction fence update). After hardening the harness (watchdog + pre-TERM stack sampling, argv-passed gates with an `all_sum` consensus assert), 12/12 cold verification cycles ran clean — `bench/wedge_verify.sh`. Not a proof the bug is gone; a reproduction with the watchdog's captured stack frame is what would settle it. Budget for wedges anyway; make long jobs resumable; never store measurements in `/tmp`.
+- **Harness `--batch` path rebased to `MLX_METAL_FAST_SYNCH=0`** (2026-08-26, wedge mitigation on the one path that wedged with MTP off): wall-clock decode reads ~35% lower there. tok/cycle and token sequences are measured invariant to sync mode, so paired judgments carry over — but do not compare `--batch` wall-clock tok/s across this date. Rebased `--batch` 13.9K baseline: 14.1–14.4 tok/s.
 
 ## 7. Numerics you should expect (not bugs)
 
@@ -228,3 +244,4 @@ Other things that will move your numbers, all measured:
 - **PP2 prefill, by contrast, is bit-exact with single-box** — zero logit mismatch over the last 32 positions across the full vocabulary. Layer-splitting does not change any reduction's shape; tensor-parallelism does.
 - The B=1 cache bypass is fp-equivalent, not bit-exact (it swaps the kernel on 41 layers).
 - On a knife-edge prompt, TP2 vs PP2 greedy output can diverge within the existing TP2 nondeterminism band; a 4-arm ablation showed the KV-injection machinery itself is exact (identical arms produce identical output) and that PP2 tracks single-box more faithfully than TP2 does.
+- **The stack is run-to-run bit-deterministic.** Re-running the same configuration reproduces the token sequence exactly (24/24 topic sha1 hashes identical across reruns), `MLX_METAL_FAST_SYNCH` 0 vs 1 does not change token sequences (8/8 identical), and A/B arm order doesn't either (the reversed recirculation run reproduced the forward run bit-for-bit per arm). Consequence: paired scatter across *topics* is topic heterogeneity, not noise — and any output difference you see between two runs means a real configuration difference, not "GPU nondeterminism".

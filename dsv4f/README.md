@@ -218,6 +218,23 @@ measurably faster raw (1030 vs 992 tok/s) but produces *different argmax output*
 is true on the single-box control, so it is not a PP2 bug, it is a property of chunked
 prefill here. Larger chunks are worse *and* wrong: 4096 measured −26%, 8192 −41%. Keep 2048.
 
+Independent cross-check on the 2048 choice: on the same 256-expert / 6-per-token geometry,
+[an unrelated ds4-server investigation](https://artifacts.nacyot.com/moe-prefill-quantum/)
+derived tokens-per-expert = chunk × 6/256 and measured per-token cost flattening at 48
+tokens/expert — which is exactly chunk 2048. (Their engine gains a further 5–9% at 4096+;
+ours measurably regresses there, so that part does not transfer.)
+
+### MTP recirculation (default on since 2026-08-26)
+
+`serve_b_pp2.sh` exports `OMLX_MTP_RECIRC_ALPHA2=0.20` and `OMLX_MTP_RECIRC_ALPHA3=0.20`.
+This blends the backbone hidden state into the draft chain at depths 2–3 (L2-norm-matched,
+inspired by [arXiv 2608.17981](https://arxiv.org/abs/2608.17981)). Measured effect, 24-topic
+paired bs1: **+1.01% tok/cycle, depth-3 acceptance 34.3% → 41.2%**, at zero measured cost
+(MTP ms/cycle no higher with it on, no memory delta). The A/B was run in both orders
+(OFF→ON and ON→OFF) and reproduced **bit-identically** — same per-topic token hashes and
+tok/cycle either way. Small but free; delete the two lines to turn it off. The rollback
+launcher `serve_b.sh` intentionally does not set them.
+
 ### Live prefill/decode dashboard
 
 `DSV4_DASH=1` (default; set `0` to disable) adds two rank-0 endpoints to the same `:8003`
@@ -363,14 +380,39 @@ MTP[0] finish=stop tokens=512 cycles=208 tok/cycle=2.462 accept=304/416 (73.1%) 
 
 How to read it:
 
-- **`tok/cycle`** is the number that matters — committed tokens per verify cycle. 1.0 means MTP is doing nothing for you. Production sits at **2.35–2.46**.
-- **`d1/d2/d3`** are per-depth acceptance: accepted / offered at that chain position. `d1` 73–79%, `d2` ~61%, `d3` ~31–34% is healthy. Note `d2`'s denominator is smaller than `d1`'s — depth *n* is only offered when depth *n−1* was accepted.
+- **`tok/cycle`** is the number that matters — committed tokens per verify cycle. 1.0 means MTP is doing nothing for you. Production sits at **2.4–2.7** with recirculation on (2.35–2.46 without).
+- **`d1/d2/d3`** are per-depth acceptance: accepted / offered at that chain position. `d1` 73–79%, `d2` ~61%, `d3` ~39–41% with recirculation (~31–34% without) is healthy. Note `d2`'s denominator is smaller than `d1`'s — depth *n* is only offered when depth *n−1* was accepted.
 - The line is printed **once per rank**, so you will see each result twice under TP2. Take the first.
 - **MTP auto-disables at batch > 1.** `serve_b.sh` has no rowwise override, so production activates MTP only at batch size 1. If you want to measure MTP at bs8 you must set `OMLX_MTP_ROWWISE_BATCH=1` — and be aware that this is a regime production never runs in, which is exactly the mistake an external audit caught us making.
 
 `align/p1_paired_analysis.py` parses these lines out of a `run_tp2_flash.py --all-topics`
 log and does the per-topic pairing, sign test, and pooled aggregate — that is how the
 round-2 vs round-6c comparison in [EXPECTED_RESULTS.md](EXPECTED_RESULTS.md) was produced.
+One parsing trap: the telemetry line prints once per rank and rank stdout can lag, so a
+duplicate line may appear *past* the next topic's header — pair topics to stats by content
+(dedup consecutive identical tuples), never by line position.
+
+### 5e. Wedge verification (optional, reliability)
+
+Two-box MLX work has a known failure mode: a stochastic collective **wedge** — both ranks
+alive, 0% GPU, no error, no progress. We root-caused the plausible mechanism to the
+`MLX_METAL_FAST_SYNCH=1` fence layer ignoring command-buffer errors (details and an
+optional guarded mlx build in
+[`avlp12/local-llm-serving`](https://github.com/avlp12/local-llm-serving)), hardened the
+harness (watchdog + automatic stack sampling before TERM, gates passed by argv with an
+`all_sum` consensus assert so ranks can never silently disagree), and verify with cold
+cycles:
+
+```bash
+bench/wedge_verify.sh 8   # 8 cold --all-topics cycles + 4 cold --batch 13.9K cycles
+```
+
+Expected: all cycles clean, `WEDGE_ALERT` count 0 on both boxes (ours: 12/12 after the
+hardening; the same suite previously reproduced wedges twice). Note the harness now
+defaults the `--batch` path to `MLX_METAL_FAST_SYNCH=0`, which reads ~35% slower on
+wall-clock decode — **tok/cycle and token sequences are measured invariant to the sync
+mode**, so judgments are unaffected, but do not compare `--batch` wall-clock tok/s across
+this boundary.
 
 ---
 

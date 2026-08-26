@@ -12,7 +12,10 @@ cluster linked by **Thunderbolt 5**, using MLX.
 The target this repo is written against, and the number you should be able to reproduce:
 
 > **DeepSeek-V4-Flash-0731, 4-bit, served across both boxes: prefill 1012 tok/s on a 13.9K-token
-> prompt (TTFT 13.79 s), decode 45–47 tok/s single-stream / 112–117 tok/s aggregate at batch 8.**
+> prompt (TTFT 13.7 s), decode 45–47 tok/s single-stream / 112–117 tok/s aggregate at batch 8.**
+
+One-page summary of the full result set (prefill pipeline, decode levers, observability,
+reliability): [`assets/infographic.png`](assets/infographic.png).
 
 This root README is the **model-agnostic layer**: hardware, wiring, network configuration,
 software pinning, the safety rules, and how to verify your interconnect before you load a
