@@ -218,6 +218,43 @@ measurably faster raw (1030 vs 992 tok/s) but produces *different argmax output*
 is true on the single-box control, so it is not a PP2 bug, it is a property of chunked
 prefill here. Larger chunks are worse *and* wrong: 4096 measured −26%, 8192 −41%. Keep 2048.
 
+### Live prefill/decode dashboard
+
+`DSV4_DASH=1` (default; set `0` to disable) adds two rank-0 endpoints to the same `:8003`
+server:
+
+| | |
+|---|---|
+| `GET /dash` | self-contained HTML dashboard (no CDN, inline JS/CSS) |
+| `GET /metrics?since=<id>` | JSON event delta + current state, for incremental 1 Hz polling |
+
+Open `http://<box A>:8003/dash`. Two stacked tracks share one horizontal time axis: prefill
+tok/s on top, generation tok/s below, **each normalised to its own axis — do not compare bar
+heights across tracks**. Intervals where prefill and decode actually overlapped are shaded
+grey; with `DSV4_PP2_INTERLEAVE=1` that overlap is the normal steady state, because the HOL
+interleave runs live batch-decode steps at every 2048-token prefill seam.
+
+Instrumentation is a `deque` append plus a `perf_counter()` read. No `mx` op is added to any
+measured path, so nothing forces a lazy graph to fold early and distort the wall clock.
+Event sources:
+
+- **prefill** — on the PP2 path, one event per 2048-token chunk, timed seam-to-seam with the
+  seam *body* (the interleaved decode steps) excluded, so prefill and decode are never
+  double-counted. On the legacy path, the per-step delta of `BatchGenerator`'s own
+  `_prompt_tokens_counter` / `_prompt_time_counter`, which cover the prompt forward only and
+  therefore exclude queue and dispatch overhead.
+- **decode** — tokens actually handed to clients, bucketed per wall-clock second, with the
+  live session count.
+- **TTFT and request boundaries**, **MTP telemetry** (`tok/cycle` and per-depth accept rates,
+  scraped off the existing log record emitted at sequence finish), and prefix-snapshot hits.
+
+Only rank 0 records, since only rank 0 serves HTTP. Rank 1's lower-slice prefill is not
+measured separately — it is approximated by rank 0's seam timestamps, which is exact enough
+because the two ranks synchronise on every chunk.
+
+The buffer holds the last 60 minutes (`DSV4_DASH_WINDOW_S`); the page offers 5 / 15 /
+60-minute views, and `#w=300` in the URL selects one directly (useful for screenshots).
+
 ### Stopping
 
 Use `cluster/tp2_guard.sh`'s `tp2_safe_shutdown` (quiesce 20 s, TERM, wait 3 min, never

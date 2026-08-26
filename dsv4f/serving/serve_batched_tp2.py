@@ -234,6 +234,28 @@ def main():
     # 이음새 콜백 홀더 — 랭크별 루프가 자기 콜백을 심는다(OFF 면 None = 무변경).
     _seam = {"cb": None}
 
+    # ── 실시간 감시 대시보드 (DSV4_DASH=1 기본 ON · 0 으로 끔) ────────────────
+    # 계측은 deque append + perf_counter 뿐이다. mx 연산·동기화를 일절 추가하지
+    # 않으므로 lazy 그래프가 접히지 않고 벽시계도 바뀌지 않는다.
+    # 랭크1 은 서빙 HTTP 가 없으므로 기록 자체를 끈다(대칭성 검토 면적 축소).
+    import dash_metrics
+    _dash = dash_metrics.Dash(cfg={
+        "pp2": _pp2 is not None,
+        "interleave": bool(PP2_INTERLEAVE),
+        "snapstore": bool(PP2_SNAPSTORE),
+        "chunk": (_pp2.chunk if _pp2 is not None else None),
+        "min_tokens": (_PP2_MIN if _pp2 is not None else None),
+        "mtp_depth": _depth,
+        "model": args.model_name,
+        "win_s": dash_metrics.WINDOW_S,
+    })
+    if rank != 0:
+        _dash.enabled = False
+    elif _dash.enabled:
+        _dash.attach_mtp_logger()
+        print(f"[dash] 실시간 감시 대시보드 on — :{args.port}/dash · :{args.port}/metrics",
+              flush=True)
+
     def _snap_canon(full):
         """스토어 저장본을 **와이어 형태로 정규화**한 독립 사본으로 만든다.
 
@@ -303,6 +325,7 @@ def main():
                                          all_tokens=[ids[:pref]])
                 if rank == 0:
                     print(f"[snap] 적중 {pref}/{len(ids)} tok 재사용", flush=True)
+                _dash.snap("hit", pref, len(ids))
             elif _pp2 is not None and len(ids) >= _PP2_MIN:
                 # PP2 경로: 프리필을 BatchGenerator 밖(2박스 층-파이프라인)에서 끝내고
                 # 완성된 전층 캐시를 주입 — 스냅숏 적중과 동일한 삽입 계약.
@@ -313,9 +336,33 @@ def main():
                 #   게이트 off 면 종전대로 take_primed 가 None → unprimed 폴백.
                 pref = len(key)
                 _ta = time.perf_counter()
-                full = _pp2.build_cache(
-                    ids, on_seam=(_seam["cb"] if PP2_INTERLEAVE else None))
+                _cb0 = _seam["cb"] if PP2_INTERLEAVE else None
+                _cb = _cb0
+                if _dash.enabled and _cb0 is not None:
+                    # 청크별 프리필 tok/s: 이음새 i 는 청크 i 의 forward **직후**에
+                    # 불리므로 (직전 이음새 이탈 → 이번 이음새 진입) 구간이 곧 청크 i
+                    # 의 순 프리필 시간이다. 이음새 **본문**(HOL 인터리브 디코드
+                    # 스텝)은 제외 — 그 시간은 디코드 버킷이 이미 세므로 넣으면
+                    # 이중 계상이 된다. 스케줄은 PP2 와 동일한 make_schedule 로
+                    # 재구성하므로 이음새 호출 횟수(=청크 수)와 인덱스가 정확히 맞는다.
+                    _sched = pp2_prefill_stage.make_schedule(len(key), _pp2.chunk)
+
+                    def _cb(_s=_sched, _i=[0], _f=_cb0):
+                        _dash.pf_close(_s[_i[0]] if _i[0] < len(_s) else 0, src="pp2")
+                        _i[0] += 1
+                        _f()
+                        _dash.pf_open()
+                    _dash.pf_open()
+                full = _pp2.build_cache(ids, on_seam=_cb)
                 _tb = time.perf_counter()
+                if _dash.enabled:
+                    if _cb0 is None:
+                        # 이음새 없음(인터리브 off) → 요청 단위 1건으로 기록
+                        _dash.pf_span(len(key), _tb - _ta, src="pp2w")
+                    else:
+                        # 마지막 이음새 이후 잔여(캐시 인계·조립)는 프리필 아님 → 폐기
+                        _dash.pf_close(0)
+                    _dash.snap("pp2store" if PP2_SNAPSTORE else "pp2build", len(key))
                 if PP2_SNAPSTORE and len(key) >= SNAP_MIN_TOKENS:
                     # 스냅숏 계약과 동일: 키 = ids[:-1], 값 = 그 지점까지의 전층 캐시.
                     # PP2 캐시는 정확히 ids[:-1] 만 처리한 상태라 캡처 경계가 딱 맞는다.
@@ -363,6 +410,7 @@ def main():
             try:
                 cache, _toks = bg.extract_cache([r.uid])[r.uid]
                 snapstore.insert_cache("m", key, cache)
+                _dash.snap("store", len(key))
                 if rank == 0:
                     print(f"[snap] 저장 {len(key)} tok (store={len(snapstore)}, "
                           f"{snapstore.nbytes >> 20}MB)", flush=True)
@@ -454,11 +502,15 @@ def main():
         pending = {}
         st = {"live": 0, "ka": time.monotonic(), "in_pp2": False}
         deferred: list = []   # PP2 진행 중 보류된 PP2-적격 요청 (FIFO 유지)
+        # 대시보드용 bg 프리필 카운터 기준점 — 여기서 잡으면 워밍업분이 자연 제외.
+        _dpf = {"tok": getattr(bg, "_prompt_tokens_counter", 0),
+                "t": getattr(bg, "_prompt_time_counter", 0.0)}
 
         def _emit(rs):
             if not getattr(gen_loop, "_first", False):
                 gen_loop._first = True
                 print("[gen] 첫 토큰 생성", flush=True)
+            _ndec = 0
             for r in rs:
                 uid = uid_by_slot.get(getattr(r, "uid", None))
                 with lock:
@@ -467,14 +519,25 @@ def main():
                 t = int(r.token)
                 fin = bool(r.finish_reason) or t in eos
                 if not fin:
+                    if not j["tokens"]:
+                        # 첫 토큰 = TTFT 확정(enq 기준 — 큐 대기 포함이라
+                        # 클라이언트 체감과 같은 정의).
+                        j["t_first"] = time.perf_counter()
+                        _dash.first_token(j["t_first"] - j["t_enq"], j["n_prompt"])
                     j["tokens"].append(t)
+                    _ndec += 1
                     if j["sq"] is not None: j["sq"].put(t)
                 else:
                     if not j["done"]:
                         j["done"] = True
                         st["live"] -= 1
+                        _dash.req_done(len(j["tokens"]),
+                                       time.perf_counter() - j.get("t_first", j["t_enq"]))
                         if j["sq"] is not None: j["sq"].put(None)
                         j["ev"].set()
+            if _ndec:
+                _dash.dec_tick(_ndec, st["live"])
+            _dash.set_live(st["live"])
 
         def _insert_batch(batch, is_pp2=False):
             """batch=[(uid, ids, n, t_enq)] → 제어 프레임 1개 + 대칭 snap_insert.
@@ -512,6 +575,7 @@ def main():
             for u, uid in zip(new_uids, metas):
                 uid_by_slot[u] = uid
             st["live"] += len(items)
+            _dash.set_live(st["live"])
 
         def _drain(allow_pp2):
             """인박스(+보류분) 흡수 → 삽입.
@@ -574,6 +638,18 @@ def main():
             with _wd_busy("r0:bg.next"):
                 prs, rs = bg.next()
             t_s2 = time.perf_counter()
+            if _dash.enabled:
+                # 비-PP2 프리필: mlx_lm 이 **프롬프트 forward 구간만** 잰 누적
+                # 카운터의 스텝 간 델타 — 큐/디스패치 오버헤드가 안 섞인다.
+                # (BatchGenerator 가 카운터를 리셋하는 경로가 있어 음수 델타는
+                #  재기준만 잡고 버린다.)
+                _pt = getattr(bg, "_prompt_tokens_counter", 0)
+                _ptm = getattr(bg, "_prompt_time_counter", 0.0)
+                _dn, _dd = _pt - _dpf["tok"], _ptm - _dpf["t"]
+                if _dn or _dd:
+                    _dpf["tok"], _dpf["t"] = _pt, _ptm
+                    if _dn > 0 and _dd > 0:
+                        _dash.pf_span(_dn, _dd, src="bg")
             if _TR.get("armed") and len(_TR.get("steps", [])) < 8:
                 _TR["steps"].append(((t_s1 - t_s0) * 1e3, (t_s2 - t_s1) * 1e3))
             if prs:
@@ -648,10 +724,32 @@ def main():
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(b)))
             self.end_headers(); self.wfile.write(b)
+        def _raw(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers(); self.wfile.write(body)
         def do_GET(self):
-            if self.path == "/v1/models":
+            path, _, qs = self.path.partition("?")
+            if path == "/v1/models":
                 self._json(200, {"object": "list", "data": [
                     {"id": args.model_name, "object": "model", "owned_by": "local"}]})
+            elif path == "/metrics":
+                if not _dash.enabled:
+                    return self._json(404, {"error": "dash off (DSV4_DASH=0)"})
+                since = 0
+                for kv in qs.split("&"):
+                    k, _, v = kv.partition("=")
+                    if k == "since":
+                        try: since = int(v)
+                        except ValueError: since = 0
+                self._raw(200, dash_metrics.json_bytes(_dash.metrics(since)),
+                          "application/json; charset=utf-8")
+            elif path == "/dash":
+                if not _dash.enabled:
+                    return self._json(404, {"error": "dash off (DSV4_DASH=0)"})
+                self._raw(200, dash_metrics.html_bytes(), "text/html; charset=utf-8")
             else: self._json(404, {"error": "nf"})
         def do_POST(self):
             if self.path != "/v1/chat/completions":
@@ -671,10 +769,11 @@ def main():
                      if TRACE else ""), flush=True)
             uid = uuid.uuid4().hex
             stream = bool(payload.get("stream"))
-            j = {"tokens": [], "done": False, "ev": threading.Event(),
-                 "sq": queue.Queue() if stream else None}
-            with lock: jobs[uid] = j
             t_enq = time.perf_counter()
+            j = {"tokens": [], "done": False, "ev": threading.Event(),
+                 "sq": queue.Queue() if stream else None,
+                 "t_enq": t_enq, "n_prompt": len(ids)}
+            with lock: jobs[uid] = j
             inbox.put((uid, ids, req["max_tokens"], t_enq))
             if stream:
                 self.send_response(200)
