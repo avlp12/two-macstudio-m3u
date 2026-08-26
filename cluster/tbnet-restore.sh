@@ -22,12 +22,6 @@ NET="10.0.0"
 _bridged() { ifconfig bridge0 2>/dev/null | grep -q "member: $1 "; }
 _active()  { [ "$(ifconfig "$1" 2>/dev/null | awk '/status:/{print $2}')" = active ]; }
 
-# 우란/atom 세그먼트 복원(브리지가 존재할 때만, 게지히트 한정)
-if [ "$OCT" = 1 ] && ifconfig bridge0 >/dev/null 2>&1; then
-  ifconfig bridge0 | grep -q "inet 192.168.7.2" || \
-    ifconfig bridge0 inet 192.168.7.2 netmask 255.255.255.0 alias 2>/dev/null
-fi
-
 chosen=""
 for tries in $(seq 24); do
   for ifc in $CAND; do
@@ -56,6 +50,27 @@ for tries in $(seq 24); do
   fi
   sleep 5
 done
+
+# 우란/atom 세그먼트 복원 (게지히트 한정) — **클러스터 포트 선택 뒤에** 한다.
+# 순서가 반대면, 재열거로 케이블이 브리지 후보 포트에 오는 순간 브리지가 먼저
+# 가로채고 클러스터는 영영 못 잡는다. 포트 이름을 다시 하드코딩하지 않기 위해,
+# "고른 클러스터 포트를 뺀 나머지 활성 TB 포트"를 멤버로 삼는다.
+if [ "$OCT" = 1 ]; then
+  ifconfig bridge0 >/dev/null 2>&1 || ifconfig bridge0 create 2>/dev/null
+  if ifconfig bridge0 >/dev/null 2>&1; then
+    for u in $CAND; do
+      [ "$u" = "$chosen" ] && continue
+      _active "$u" || continue
+      ifconfig bridge0 | grep -q "member: $u " || ifconfig bridge0 addm "$u" 2>/dev/null
+    done
+    ifconfig bridge0 up 2>/dev/null
+    ifconfig bridge0 | grep -q "inet 192.168.7.2" || \
+      ifconfig bridge0 inet 192.168.7.2 netmask 255.255.255.0 alias 2>/dev/null
+    ping -c 1 -t 2 192.168.7.1 >/dev/null 2>&1 \
+      && logger "tbnet-restore: uran 192.168.7.1 확인" \
+      || logger "tbnet-restore: uran 미응답(전원/케이블 확인)"
+  fi
+fi
 
 if [ -n "$chosen" ]; then
   logger "tbnet-restore: $NET.$OCT on $chosen (peer $NET.$PEER 확인)"

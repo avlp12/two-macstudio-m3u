@@ -96,3 +96,52 @@ tb_preflight() {
   echo "[tb] ✓ 링크 정상 — $TB_PEER_IP 도달, ${mbps}MB/s (하한 ${TB_MIN_MBPS})"
   return 0
 }
+
+# ── 호스트파일 동기화 ───────────────────────────────────────────────────────
+# 구멍: tbnet-restore 가 살아있는 포트를 고르는데, jaccl 호스트파일의 rdma_enX 는
+#       정적이다. 부팅 후 포트가 바뀌면 IP 는 맞는데 RDMA 장치 이름이 어긋난다.
+# 각 박스가 부팅 시 /Users/Shared/tbnet-iface 에 자기가 고른 포트를 남기므로,
+# 그 둘을 읽어 호스트파일을 다시 만든다.
+tb_sync_hostfile() {
+  local hf="${1:-/Users/Shared/tp2/hostfile_jaccl2.json}"
+  local mine peer
+  mine=$(cat /Users/Shared/tbnet-iface 2>/dev/null)
+  peer=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$TB_PEER_SSH" 'cat /Users/Shared/tbnet-iface 2>/dev/null' 2>/dev/null)
+  # 파일이 없으면(수동 설정 등) 현재 IP 가 붙은 인터페이스에서 역추론
+  [ -z "$mine" ] && mine=$(ifconfig | awk -v ip="$TB_SELF_IP" '/^en/{i=substr($1,1,length($1)-1)} $1=="inet" && $2==ip{print i; exit}')
+  [ -z "$peer" ] && peer=$(ssh -o BatchMode=yes "$TB_PEER_SSH" "ifconfig | awk -v ip=$TB_PEER_IP '/^en/{i=substr(\$1,1,length(\$1)-1)} \$1==\"inet\" && \$2==ip{print i; exit}'" 2>/dev/null)
+  [ -z "$mine" ] || [ -z "$peer" ] && { echo "[tb] 호스트파일 동기화 불가(포트 미확인 mine=$mine peer=$peer)" >&2; return 1; }
+
+  python3 - "$hf" "$mine" "$peer" <<'PY'
+import json, sys, hashlib, os
+hf, mine, peer = sys.argv[1], sys.argv[2], sys.argv[3]
+h = json.load(open(hf))
+want = [[None, f"rdma_{mine}"], [f"rdma_{peer}", None]]
+cur = [x.get("rdma") for x in h["hosts"]]
+if cur == want:
+    print(f"[tb] 호스트파일 이미 일치 (rdma_{mine} / rdma_{peer})"); sys.exit(0)
+for host, r in zip(h["hosts"], want):
+    host["rdma"] = r
+tmp = hf + ".tmp"
+json.dump(h, open(tmp, "w"), indent=2)
+os.replace(tmp, hf)
+print(f"[tb] 호스트파일 갱신: {cur} → rdma_{mine} / rdma_{peer}")
+PY
+  scp -q "$hf" "$TB_PEER_SSH:$hf" 2>/dev/null && echo "[tb] 피어 배포 완료"
+}
+
+# ── 토폴로지 다이어트 (mDNS 폭풍 방지) ─────────────────────────────────────
+# 구멍: 예전 관행은 "en2/en3/en5 를 내린다" 였는데, 재열거로 **클러스터 링크가
+#       그 목록에 들어올 수 있다**(2026-08-26 실제로 en5 가 클러스터가 됐다).
+# 이제 살아있는 클러스터 포트와 bridge0 멤버(우란/atom)를 제외하고만 내린다.
+tb_diet() {
+  local keep; keep=$(cat /Users/Shared/tbnet-iface 2>/dev/null)
+  [ -z "$keep" ] && keep=$(ifconfig | awk -v ip="$TB_SELF_IP" '/^en/{i=substr($1,1,length($1)-1)} $1=="inet" && $2==ip{print i; exit}')
+  for i in $TB_CANDIDATES; do
+    [ "en$i" = "$keep" ] && continue
+    _tb_bridged "$i" && continue
+    _tb_active  "$i" >/dev/null || true
+    [ "$(_tb_active "$i")" = active ] && { sudo -n ifconfig "en$i" down 2>/dev/null && echo "[tb] en$i down (다이어트)"; }
+  done
+  echo "[tb] 유지: $keep (클러스터) + bridge0 멤버(우란/atom)"
+}

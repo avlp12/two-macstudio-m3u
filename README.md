@@ -153,7 +153,15 @@ already fighting a background daemon war is strictly worse than running it clean
 
 **Fix — topology diet.** Standing configuration is **one** Thunderbolt cable (serving) plus
 LAN. The other two Thunderbolt links come up only on demand, for bandwidth-bound
-experiments. `ifconfig en5 down; ifconfig en3 down` (and unplug the stray link to any
+experiments.
+
+**Never write the diet as a fixed list of interfaces.** We used to run
+`ifconfig en2 down; en3 down; en5 down` from memory. After a re-enumeration moved the
+serving cable onto `en5`, that habit would have taken the cluster link down every session.
+`tb_diet` in `cluster/tb_preflight.sh` downs every Thunderbolt port *except* the one
+currently carrying the cluster IP and any `bridge0` member, so it can never cut the link
+it is supposed to protect. Historically the manual form was `ifconfig en5 down;
+ifconfig en3 down` (and unplug the stray link to any
 third machine). Effect was immediate: `mDNSResponder` CPU went 100% → 0.0–0.9% within the
 same minute, and stayed there. Full writeup:
 [local-hardware-failures/cases/2026-08-24-tb5-multilink-crash-marathon.md](https://github.com/avlp12/local-hardware-failures/blob/main/cases/2026-08-24-tb5-multilink-crash-marathon.md).
