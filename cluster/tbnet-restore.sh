@@ -8,8 +8,16 @@
 #   으로 강등했다 — 집합 연산이 220배 느려졌는데 아무 오류도 안 났다.
 #   이제 **캐리어 있는 포트를 골라 붙이고, 피어 응답으로 검증**한다.
 #
-# bridge0 멤버는 건드리지 않는다. 게지히트 bridge0(192.168.7.2)에는 우란(Windows/RTX5090)이
-# 붙어 있어, 여기에 클러스터 IP 를 얹으면 그 링크가 죽는다.
+# 2026-08-26 저녁 (PA510): 피어 창을 놓치면 세 가지가 겹쳤다.
+#   1) chosen 이 빈 채로 "나머지 활성 포트"를 bridge0 에 넣어 클러스터 포트(en5)가
+#      브리지에 먹힘. chosen 이 비면 새 멤버를 추가하지 않는다(기존 en2/우란 유지).
+#   2) ifconfig alias 는 10.0.0.0/24 연결 라우트를 이전 포트에 남긴다. ifscope 가
+#      아니라 일반 연결 라우트라 route delete -ifscope 로는 안 지워진다.
+#      붙인 뒤 route delete 10/24 + route add -interface $chosen 으로 강제 정렬.
+#   3) 피어 미확인 때 tbnet-iface 를 안 남겨 tb_sync_hostfile 이 근거를 잃음.
+#      캐리어 있는 비-브리지 포트가 있으면 기록하고 status=peer-unconfirmed.
+#
+# bridge0 멤버 중 우란(en2, 192.168.7.x)은 건드리지 않는다.
 
 case "$(scutil --get LocalHostName 2>/dev/null)" in
   *gesicht*|*Gesicht*) OCT=1; PEER=2 ;;
@@ -17,52 +25,140 @@ case "$(scutil --get LocalHostName 2>/dev/null)" in
 esac
 
 CAND="${TBNET_CAND:-en4 en5 en3 en2 en6 en7}"
+URAN_IF="${TBNET_URAN_IFACE:-en2}"
 NET="10.0.0"
+SELF_IP="$NET.$OCT"
+PEER_IP="$NET.$PEER"
+IFACE_FILE="/Users/Shared/tbnet-iface"
+IFACE_STATUS="/Users/Shared/tbnet-iface.status"
+DRY="${TBNET_DRY:-0}"
 
 _bridged() { ifconfig bridge0 2>/dev/null | grep -q "member: $1 "; }
 _active()  { [ "$(ifconfig "$1" 2>/dev/null | awk '/status:/{print $2}')" = active ]; }
+_exists()  { ifconfig "$1" >/dev/null 2>&1; }
+_is_uran() { [ "$1" = "$URAN_IF" ]; }
+
+# 클러스터 후보: 존재하고, 우란이 아니고, 브리지 멤버가 아니고, 캐리어가 있는 포트.
+_cluster_ok() {
+  _exists "$1" || return 1
+  _is_uran "$1" && return 1
+  _bridged "$1" && return 1
+  _active "$1"
+}
+
+_first_cluster_cand() {
+  local ifc
+  for ifc in $CAND; do
+    _cluster_ok "$ifc" && { printf '%s\n' "$ifc"; return 0; }
+  done
+  return 1
+}
+
+_has_self_ip() { ifconfig "$1" 2>/dev/null | grep -q "inet $SELF_IP "; }
+
+# 모든 후보에서 클러스터 IP 만 벗긴다. 192.168.7.x 는 건드리지 않는다.
+_strip_cluster_ip() {
+  local ifc
+  for ifc in $CAND; do
+    _exists "$ifc" || continue
+    _has_self_ip "$ifc" || continue
+    if [ "$DRY" = 1 ]; then
+      echo "[tbnet-dry] would strip $SELF_IP from $ifc"
+      continue
+    fi
+    ifconfig "$ifc" inet "$SELF_IP" -alias 2>/dev/null
+  done
+}
+
+# 오늘 실측된 유효 절차: /24 를 일반 연결 라우트로 지우고 $1 에 다시 붙인다.
+_align_route() {
+  local ifc="$1"
+  if [ "$DRY" = 1 ]; then
+    echo "[tbnet-dry] would route 10.0.0.0/24 -> $ifc"
+    return 0
+  fi
+  route -n delete -net 10.0.0.0 -netmask 255.255.255.0 >/dev/null 2>&1
+  route add -net 10.0.0.0 -netmask 255.255.255.0 -interface "$ifc" >/dev/null 2>&1
+}
+
+_bind_cluster() {
+  local ifc="$1"
+  _strip_cluster_ip
+  if [ "$DRY" = 1 ]; then
+    echo "[tbnet-dry] would bind $SELF_IP alias on $ifc"
+    _align_route "$ifc"
+    return 0
+  fi
+  ifconfig "$ifc" inet "$SELF_IP" netmask 255.255.255.0 alias 2>/dev/null
+  _align_route "$ifc"
+}
+
+_write_iface() {
+  local ifc="$1" st="$2"
+  if [ "$DRY" = 1 ]; then
+    echo "[tbnet-dry] would write $IFACE_FILE=$ifc status=$st"
+    return 0
+  fi
+  printf '%s\n' "$ifc" > "$IFACE_FILE" 2>/dev/null
+  printf '%s\n' "$st" > "$IFACE_STATUS" 2>/dev/null
+}
+
+if [ "$DRY" = 1 ]; then
+  echo "[tbnet-dry] host OCT=.$OCT peer=$PEER_IP uran=$URAN_IF"
+  echo "[tbnet-dry] candidates:"
+  for ifc in $CAND; do
+    _exists "$ifc" || { echo "  $ifc missing"; continue; }
+    s=$(ifconfig "$ifc" 2>/dev/null | awk '/status:/{print $2}')
+    b=""; _bridged "$ifc" && b=" bridged"
+    u=""; _is_uran "$ifc" && u=" uran"
+    c=""; _cluster_ok "$ifc" && c=" CLUSTER_OK"
+    echo "  $ifc status=$s$b$u$c"
+  done
+  hope=$(_first_cluster_cand || true)
+  echo "[tbnet-dry] first cluster candidate: ${hope:-none}"
+  echo "[tbnet-dry] if chosen empty: will NOT addm to bridge0"
+  exit 0
+fi
 
 chosen=""
 for tries in $(seq 24); do
   for ifc in $CAND; do
-    ifconfig "$ifc" >/dev/null 2>&1 || continue
-    _bridged "$ifc" && continue          # 우란/atom 링크 보호
-    _active "$ifc"  || continue          # 캐리어 없는 포트에 붙이지 않는다 (구판의 결함)
-
-    cur=$(ifconfig "$ifc" | awk '/inet /{print $2}' | head -1)
-    [ "$cur" = "$NET.$OCT" ] || ifconfig "$ifc" inet "$NET.$OCT" netmask 255.255.255.0 alias 2>/dev/null
+    _cluster_ok "$ifc" || continue
+    _bind_cluster "$ifc"
     sleep 1
-    # 피어 응답으로 검증 — 둘 중 늦게 뜬 쪽이 성공하면 양쪽 다 성공이다
-    if ping -c 1 -t 2 "$NET.$PEER" >/dev/null 2>&1; then chosen="$ifc"; break 2; fi
-    # 실패한 후보는 되돌린다(주소 중복 방지)
-    [ "$cur" = "$NET.$OCT" ] || ifconfig "$ifc" inet "$NET.$OCT" -alias 2>/dev/null
+    if ping -c 1 -t 2 "$PEER_IP" >/dev/null 2>&1; then
+      chosen="$ifc"
+      break 2
+    fi
   done
-  # 아직 피어가 안 떴을 수 있다 — 후보 중 활성인 첫 포트에 붙여두고 다음 라운드에서 재검증
+  # 피어가 아직 없으면 첫 클러스터 후보에 IP+/24 를 유지한 채 다음 라운드에서 재검증.
+  # 브리지에는 아직 넣지 않는다.
   if [ -z "$chosen" ]; then
-    for ifc in $CAND; do
-      ifconfig "$ifc" >/dev/null 2>&1 || continue
-      _bridged "$ifc" && continue
-      _active "$ifc" || continue
-      ifconfig "$ifc" | grep -q "inet $NET.$OCT" || \
-        ifconfig "$ifc" inet "$NET.$OCT" netmask 255.255.255.0 alias 2>/dev/null
-      break
-    done
+    hope=$(_first_cluster_cand || true)
+    [ -n "$hope" ] && _bind_cluster "$hope"
   fi
   sleep 5
 done
 
-# 우란/atom 세그먼트 복원 (게지히트 한정) — **클러스터 포트 선택 뒤에** 한다.
-# 순서가 반대면, 재열거로 케이블이 브리지 후보 포트에 오는 순간 브리지가 먼저
-# 가로채고 클러스터는 영영 못 잡는다. 포트 이름을 다시 하드코딩하지 않기 위해,
-# "고른 클러스터 포트를 뺀 나머지 활성 TB 포트"를 멤버로 삼는다.
+# 우란 세그먼트 복원 (게지히트 한정) — **클러스터 포트가 확정된 뒤에만** 새 멤버 추가.
+# chosen 이 비면 기존 멤버(en2)만 유지한다. en2 / 192.168.7.x 는 제거하지 않는다.
 if [ "$OCT" = 1 ]; then
   ifconfig bridge0 >/dev/null 2>&1 || ifconfig bridge0 create 2>/dev/null
   if ifconfig bridge0 >/dev/null 2>&1; then
-    for u in $CAND; do
-      [ "$u" = "$chosen" ] && continue
-      _active "$u" || continue
-      ifconfig bridge0 | grep -q "member: $u " || ifconfig bridge0 addm "$u" 2>/dev/null
-    done
+    if [ -n "$chosen" ]; then
+      if _bridged "$chosen"; then
+        ifconfig bridge0 deletem "$chosen" 2>/dev/null
+        logger "tbnet-restore: $chosen 을 bridge0 에서 분리 (클러스터)"
+      fi
+      for u in $CAND; do
+        [ "$u" = "$chosen" ] && continue
+        _active "$u" || continue
+        # en2(우란) 포함 — 클러스터 포트만 빼고, 기존 멤버는 addm 이 그대로 유지.
+        ifconfig bridge0 | grep -q "member: $u " || ifconfig bridge0 addm "$u" 2>/dev/null
+      done
+    else
+      logger "tbnet-restore: 피어 미확인 — bridge0 에 새 멤버를 추가하지 않음"
+    fi
     ifconfig bridge0 up 2>/dev/null
     ifconfig bridge0 | grep -q "inet 192.168.7.2" || \
       ifconfig bridge0 inet 192.168.7.2 netmask 255.255.255.0 alias 2>/dev/null
@@ -73,9 +169,17 @@ if [ "$OCT" = 1 ]; then
 fi
 
 if [ -n "$chosen" ]; then
-  logger "tbnet-restore: $NET.$OCT on $chosen (peer $NET.$PEER 확인)"
-  echo "$chosen" > /Users/Shared/tbnet-iface 2>/dev/null
+  _bind_cluster "$chosen"
+  _write_iface "$chosen" "peer-ok"
+  logger "tbnet-restore: $SELF_IP on $chosen (peer $PEER_IP 확인)"
 else
-  act=$(for i in $CAND; do _active "$i" && ! _bridged "$i" && printf "%s " "$i"; done)
-  logger "tbnet-restore: 피어 미확인 — 활성 비-브리지 포트[$act]. jaccl 호스트파일의 rdma_enX 확인 필요"
+  hope=$(_first_cluster_cand || true)
+  if [ -n "$hope" ]; then
+    _bind_cluster "$hope"
+    _write_iface "$hope" "peer-unconfirmed"
+    logger "tbnet-restore: 피어 미확인 — $SELF_IP on $hope (tbnet-iface 기록, 브리지 추가 없음)"
+  else
+    act=$(for i in $CAND; do _active "$i" && ! _bridged "$i" && ! _is_uran "$i" && printf "%s " "$i"; done)
+    logger "tbnet-restore: 피어 미확인 — 활성 비-브리지 클러스터 후보[$act]. jaccl 호스트파일의 rdma_enX 확인 필요"
+  fi
 fi
