@@ -255,6 +255,17 @@ def main():
         _dash.attach_mtp_logger()
         print(f"[dash] 실시간 감시 대시보드 on — :{args.port}/dash · :{args.port}/metrics",
               flush=True)
+        # 영속화(SQLite/WAL). 쓰기는 gen_loop 밖 사이드 스레드 — 측정 경로는 무영향.
+        # 실패해도 라이브 대시보드는 그대로 뜬다(치명 처리 안 함).
+        _st = _dash.attach_store()
+        if _st is None:
+            print("[dash] 영속화 off (DSV4_DASH_PERSIST=0)", flush=True)
+        elif _st.ok:
+            print(f"[dash] 영속화 on — {_st.path} boot_id={_st.boot_id} "
+                  f"(보존 {dash_metrics.RETENTION_DAYS:.0f}일 · flush {dash_metrics.FLUSH_S}s)",
+                  flush=True)
+        else:
+            print(f"[dash] 영속화 실패(라이브는 계속): {_st.err}", flush=True)
 
     def _snap_canon(full):
         """스토어 저장본을 **와이어 형태로 정규화**한 독립 사본으로 만든다.
@@ -738,13 +749,28 @@ def main():
             elif path == "/metrics":
                 if not _dash.enabled:
                     return self._json(404, {"error": "dash off (DSV4_DASH=0)"})
-                since = 0
+                q = {}
                 for kv in qs.split("&"):
                     k, _, v = kv.partition("=")
-                    if k == "since":
-                        try: since = int(v)
-                        except ValueError: since = 0
-                self._raw(200, dash_metrics.json_bytes(_dash.metrics(since)),
+                    if k: q[k] = v
+                def _qf(name, dflt=None):
+                    try: return float(q[name])
+                    except (KeyError, ValueError): return dflt
+                if "sessions" in q:
+                    # 회고 뷰 세션 목록(재기동 경계 구분용)
+                    body = {"sessions": (_dash.store.sessions()
+                                         if _dash.store is not None else []),
+                            "store": (_dash.store.stats() if _dash.store is not None
+                                      else {"enabled": False})}
+                elif "from" in q or "to" in q:
+                    # 회고 구간 조회(절대 epoch) — DB 만 읽고 라이브 링버퍼는 무접촉
+                    _to = _qf("to", time.time())
+                    body = _dash.history(_qf("from", _to - 3600.0), _to)
+                else:
+                    try: since = int(q.get("since", 0))
+                    except ValueError: since = 0
+                    body = _dash.metrics(since)
+                self._raw(200, dash_metrics.json_bytes(body),
                           "application/json; charset=utf-8")
             elif path == "/dash":
                 if not _dash.enabled:

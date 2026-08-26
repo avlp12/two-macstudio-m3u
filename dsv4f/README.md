@@ -255,6 +255,39 @@ because the two ranks synchronise on every chunk.
 The buffer holds the last 60 minutes (`DSV4_DASH_WINDOW_S`); the page offers 5 / 15 /
 60-minute views, and `#w=300` in the URL selects one directly (useful for screenshots).
 
+#### Persistence — the accumulating view
+
+The live view is the in-memory ring buffer, but every event is also written to SQLite
+(stdlib only, no new dependency) at `~/dsv4flash/metrics/serving_metrics.sqlite`
+(`DSV4_DASH_DB`), so the monitoring data keeps accumulating whether or not anyone has the
+page open, and survives restarts. The **누적 / accumulating** tab replays any past window.
+
+- **WAL journal mode**, so you can query the file with any sqlite client while serving is
+  writing to it.
+- Every event stores both a session-relative time (`t0`/`t1`) and an **absolute unix epoch**
+  (`w0`/`w1`). Relative time resets to zero on every boot; the epoch column is what lets the
+  retrospective view stitch sessions into one continuous timeline. A `sessions` table records
+  each boot (`boot_id`, start/end wall time, host, pid, model, env summary), and the
+  accumulating view draws a dashed marker at every boot boundary.
+- Writes happen on a **side thread** outside `gen_loop`, batched every `DSV4_DASH_FLUSH_S`
+  seconds (default 2) on its own connection. sqlite is pure CPU, so it is unconstrained by
+  the `mx` rules that govern the measured path; the measured path itself gains only one list
+  append. Readers open a short-lived connection per request — connections are never shared
+  across threads.
+- **No SIGTERM handler, deliberately.** Installing one would turn TERM from "immediate
+  process death" into "dies once the main thread reaches a bytecode boundary", which means
+  TERM would not land at all on a rank stuck inside a collective — exactly the case R2's
+  "TERM-unresponsive → reboot" rule exists for. Operational safety wins over a 2-second
+  tail, so a TERM'd server loses at most `DSV4_DASH_FLUSH_S` seconds of events; clean exits
+  are covered by `atexit`.
+- Retention is `DSV4_DASH_RETENTION_DAYS` (default 30), purged once at boot.
+- Query it over HTTP too: `GET /metrics?sessions=1` lists boots,
+  `GET /metrics?from=<epoch>&to=<epoch>` returns a range with a summary block
+  (weighted-average prefill tok/s, decode tokens, TTFT p50/max, mean MTP tok/cycle).
+  `#history` on the dashboard opens the same thing, `#history&h=86400` picks the span.
+- Set `DSV4_DASH_PERSIST=0` to disable. A persistence failure is logged and never fatal —
+  the live dashboard still comes up.
+
 ### Stopping
 
 Use `cluster/tp2_guard.sh`'s `tp2_safe_shutdown` (quiesce 20 s, TERM, wait 3 min, never

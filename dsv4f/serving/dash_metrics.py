@@ -30,11 +30,30 @@
   · 랭크1 의 하단-슬라이스 프리필은 별도 계측하지 않고 **랭크0 이음새 시점으로
     근사**한다(PP2 는 청크마다 랭크1→랭크0 활성값 전송으로 동기되므로 이음새
     간격이 곧 양 랭크 합산 청크 시간이다). 대시보드 각주에 명시.
+
+영속 축적(SQLite · stdlib 전용, 신규 의존성 없음):
+  · 라이브 뷰는 **인메모리 링버퍼 그대로**(성능), 회고 뷰만 DB 를 읽는다.
+  · rank0 전용. 파일 `~/dsv4flash/metrics/serving_metrics.sqlite`(DSV4_DASH_DB).
+    WAL 모드라 서빙이 쓰는 동안 외부 프로세스가 그대로 읽을 수 있다.
+  · 이벤트는 상대시각(t0/t1, 세션 기준)과 **절대시각(w0/w1, unix epoch)** 을 함께
+    저장한다 → 재기동으로 상대시각이 0 으로 리셋돼도 세션 간 타임라인이 이어진다.
+  · 쓰기는 gen_loop **밖** 사이드 스레드가 2초 주기로 배치 flush(자체 커넥션).
+    sqlite 는 순수 CPU 라 mx 제약과 무관하고, 측정 경로는 리스트 append 하나만 는다.
+  · 읽기(HTTP 스레드)는 요청마다 짧은 읽기 전용 커넥션을 연다 — sqlite 커넥션을
+    스레드 간 공유하지 않는다는 규칙을 그대로 지킨다.
+  · **SIGTERM 최종 flush 는 일부러 안 건다**: 핸들러를 걸면 TERM 이 '즉시 종료'에서
+    '메인 스레드가 바이트코드 경계에 닿을 때 종료'로 바뀐다. 집합연산에 갇힌
+    랭크에는 TERM 이 아예 안 먹게 되어 R2 의 'TERM-불응 → 재부팅 권고' 를 유발한다.
+    운영 안전(R2)이 꼬리 2초보다 중요하므로, TERM 시 최대 DSV4_DASH_FLUSH_S 초 분량만
+    유실하도록 두고 정상 종료 경로는 atexit 로 덮는다.
 """
 
+import atexit
 import json
 import os
 import re
+import socket
+import sqlite3
 import threading
 import time
 from collections import deque
@@ -42,11 +61,202 @@ from collections import deque
 _ENV = os.environ.get("DSV4_DASH", "1").strip().lower()
 ENABLED = _ENV not in ("0", "", "false", "off")
 
+
+def _env_on(name, default="1"):
+    return os.environ.get(name, default).strip().lower() not in ("0", "", "false", "off")
+
+
 WINDOW_S = float(os.environ.get("DSV4_DASH_WINDOW_S", "3600"))
 MAXLEN = int(os.environ.get("DSV4_DASH_MAXLEN", "20000"))
 # 이보다 작은 프리필 조각은 바로 그리지 않는다(PP2 주입 뒤 꼬리 토큰 1개 forward
 # 같은 것들 — 20 tok/s 짜리 노이즈 바가 타임라인을 더럽힌다).
 PF_MIN_TOKENS = int(os.environ.get("DSV4_DASH_PF_MIN", "16"))
+
+# ── 영속화 ────────────────────────────────────────────────────────────────
+PERSIST = _env_on("DSV4_DASH_PERSIST")
+DB_PATH = os.environ.get(
+    "DSV4_DASH_DB", os.path.expanduser("~/dsv4flash/metrics/serving_metrics.sqlite"))
+RETENTION_DAYS = float(os.environ.get("DSV4_DASH_RETENTION_DAYS", "30"))
+FLUSH_S = float(os.environ.get("DSV4_DASH_FLUSH_S", "2"))
+# 회고 쿼리 1회 상한(브라우저·직렬화 보호). 초과 시 truncated=true 로 알린다.
+READ_LIMIT = int(os.environ.get("DSV4_DASH_READ_LIMIT", "120000"))
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions(
+  boot_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  started_wall REAL NOT NULL,
+  ended_wall   REAL,
+  host         TEXT,
+  pid          INTEGER,
+  model        TEXT,
+  cfg          TEXT
+);
+CREATE TABLE IF NOT EXISTS events(
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  boot_id INTEGER NOT NULL,
+  k       TEXT NOT NULL,
+  w0      REAL NOT NULL,   -- 절대 epoch 시작 (세션 간 연결용)
+  w1      REAL NOT NULL,   -- 절대 epoch 끝
+  t0      REAL NOT NULL,   -- 세션 상대 초 (원본 스키마 보존)
+  t1      REAL NOT NULL,
+  n       INTEGER,
+  tps     REAL,
+  src     TEXT,
+  act     INTEGER,
+  extra   TEXT             -- 나머지 필드 JSON (ttft·d·kind·tot·n_prompt…)
+);
+CREATE INDEX IF NOT EXISTS ix_events_w0   ON events(w0);
+CREATE INDEX IF NOT EXISTS ix_events_boot ON events(boot_id, w0);
+"""
+
+# 정규화 컬럼으로 뽑는 필드(나머지는 extra JSON)
+_COLS = ("n", "tps", "src", "act")
+_SKIP = {"i", "t0", "t1", "k"} | set(_COLS)
+
+
+class Store:
+    """이벤트 SQLite 영속화. 실패는 전부 삼키고 서빙에 영향 주지 않는다."""
+
+    def __init__(self, path=DB_PATH, cfg=None, retention_days=RETENTION_DAYS,
+                 started_wall=None):
+        self.path = path
+        self.ok = False
+        self.boot_id = None
+        self.err = None
+        self._stop = threading.Event()
+        self._thr = None
+        self._n_written = 0
+        try:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            conn = self._connect()
+            conn.executescript(_SCHEMA)
+            # 보존 정책: 기동 시 1회 정리
+            if retention_days > 0:
+                cut = time.time() - retention_days * 86400.0
+                conn.execute("DELETE FROM events WHERE w0 < ?", (cut,))
+                conn.execute(
+                    "DELETE FROM sessions WHERE ended_wall IS NOT NULL AND ended_wall < ? "
+                    "AND boot_id NOT IN (SELECT DISTINCT boot_id FROM events)", (cut,))
+            cur = conn.execute(
+                "INSERT INTO sessions(started_wall, host, pid, model, cfg) "
+                "VALUES(?,?,?,?,?)",
+                # Dash 의 벽시계 기준과 **같은 값**을 쓴다 — 그래야 회고 뷰의 재기동
+                # 경계선이 그 세션 첫 이벤트와 정확히 겹친다.
+                (float(started_wall) if started_wall else time.time(),
+                 socket.gethostname(), os.getpid(),
+                 (cfg or {}).get("model"), json.dumps(cfg or {}, ensure_ascii=False)))
+            self.boot_id = cur.lastrowid
+            conn.commit()
+            conn.close()
+            self.ok = True
+        except Exception as e:                       # noqa: BLE001
+            self.err = f"{type(e).__name__}: {e}"
+
+    def _connect(self):
+        conn = sqlite3.connect(self.path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")      # 서빙이 쓰는 동안 외부 읽기 가능
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    # -- 쓰기 -------------------------------------------------------------
+    def start(self, drain):
+        """`drain()` = 대기 이벤트 리스트를 뽑아오는 콜백(Dash 가 제공)."""
+        if not self.ok:
+            return
+
+        def run():
+            conn = None
+            try:
+                conn = self._connect()
+                while not self._stop.is_set():
+                    self._stop.wait(FLUSH_S)
+                    self._write(conn, drain())
+                self._write(conn, drain())           # 최종 flush
+                conn.execute("UPDATE sessions SET ended_wall=? WHERE boot_id=?",
+                             (time.time(), self.boot_id))
+                conn.commit()
+            except Exception as e:                   # noqa: BLE001
+                self.err = f"flusher {type(e).__name__}: {e}"
+            finally:
+                if conn is not None:
+                    try: conn.close()
+                    except Exception: pass
+
+        self._thr = threading.Thread(target=run, daemon=True, name="dash-flush")
+        self._thr.start()
+        atexit.register(self.close)
+
+    def _write(self, conn, rows):
+        if not rows:
+            return
+        try:
+            conn.executemany(
+                "INSERT INTO events(boot_id,k,w0,w1,t0,t1,n,tps,src,act,extra) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)", rows)
+            conn.commit()
+            self._n_written += len(rows)
+        except Exception as e:                       # noqa: BLE001
+            self.err = f"write {type(e).__name__}: {e}"
+
+    def close(self):
+        if self._thr is not None and not self._stop.is_set():
+            self._stop.set()
+            self._thr.join(timeout=10)
+
+    # -- 읽기(HTTP 스레드: 요청마다 짧은 커넥션) --------------------------
+    def sessions(self, limit=100):
+        if not self.ok:
+            return []
+        try:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT s.boot_id, s.started_wall, s.ended_wall, s.host, s.model, "
+                "       (SELECT COUNT(*) FROM events e WHERE e.boot_id=s.boot_id), "
+                "       (SELECT MIN(w0) FROM events e WHERE e.boot_id=s.boot_id), "
+                "       (SELECT MAX(w1) FROM events e WHERE e.boot_id=s.boot_id) "
+                "FROM sessions s ORDER BY s.boot_id DESC LIMIT ?", (limit,)).fetchall()
+            conn.close()
+            return [{"boot_id": r[0], "started_wall": r[1], "ended_wall": r[2],
+                     "host": r[3], "model": r[4], "n_events": r[5],
+                     "first_w": r[6], "last_w": r[7]} for r in rows]
+        except Exception as e:                       # noqa: BLE001
+            self.err = f"sessions {type(e).__name__}: {e}"
+            return []
+
+    def read_range(self, w_from, w_to, limit=READ_LIMIT):
+        if not self.ok:
+            return [], False
+        try:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT boot_id,k,w0,w1,t0,t1,n,tps,src,act,extra FROM events "
+                "WHERE w1>=? AND w0<=? ORDER BY w0 LIMIT ?",
+                (w_from, w_to, limit + 1)).fetchall()
+            conn.close()
+        except Exception as e:                       # noqa: BLE001
+            self.err = f"read {type(e).__name__}: {e}"
+            return [], False
+        truncated = len(rows) > limit
+        out = []
+        for r in rows[:limit]:
+            e = {"boot": r[0], "k": r[1], "w0": r[2], "w1": r[3],
+                 "t0": r[4], "t1": r[5]}
+            if r[6] is not None: e["n"] = r[6]
+            if r[7] is not None: e["tps"] = r[7]
+            if r[8] is not None: e["src"] = r[8]
+            if r[9] is not None: e["act"] = r[9]
+            if r[10]:
+                try: e.update(json.loads(r[10]))
+                except Exception: pass
+            out.append(e)
+        return out, truncated
+
+    def stats(self):
+        return {"enabled": bool(self.ok), "path": self.path,
+                "boot_id": self.boot_id, "written": self._n_written,
+                "retention_days": RETENTION_DAYS, "err": self.err}
 
 _MTP_RE = re.compile(r"tok/cycle=([0-9.]+)")
 _DEPTH_RE = re.compile(r"depth\[([^\]]*)\]")
@@ -71,6 +281,12 @@ class Dash:
         self._last_ttft = None
         self._last_mtp = None
         self._live = 0
+        # 영속화: 측정 경로에서는 이 리스트에 **append 한 번**만 한다.
+        # 행 튜플 변환·INSERT 는 전부 플러셔 스레드에서(=gen_loop 밖).
+        self.store = None
+        self._persist = False
+        self._pend = []
+        self._pend_dropped = 0
 
     # ------------------------------------------------------------- 내부
     def _now(self):
@@ -84,16 +300,28 @@ class Dash:
             kw["t0"] = round(t0, 3)
             kw["t1"] = round(t1, 3)
             self._ev.append(kw)
+            self._stage_locked(kw)
+
+    def _stage_locked(self, ev):
+        """영속화 대기열 적재. 플러셔가 죽어도 메모리를 무한히 먹지 않게 상한을 둔다."""
+        if not self._persist:
+            return
+        if len(self._pend) < 500000:
+            self._pend.append(ev)
+        else:
+            self._pend_dropped += 1
 
     def _flush_bucket_locked(self, upto_b):
         cur = self._cur
         if cur["b"] >= 0 and cur["b"] < upto_b:
             self._seq += 1
-            self._ev.append({
+            ev = {
                 "i": self._seq, "k": "dec",
                 "t0": float(cur["b"]), "t1": float(cur["b"] + 1),
                 "n": cur["n"], "tps": float(cur["n"]), "act": cur["act"],
-            })
+            }
+            self._ev.append(ev)
+            self._stage_locked(ev)
             cur["b"] = -1
             cur["n"] = 0
 
@@ -247,6 +475,8 @@ class Dash:
             "since": since, "next": seq, "reset": reset,
             "win_s": WINDOW_S,
             "cfg": self.cfg,
+            "store": (self.store.stats() if self.store is not None
+                      else {"enabled": False}),
             "now": {
                 "prefill_tps": round(pf_n / pf_d, 1) if pf_d > 0 else 0.0,
                 "decode_tps": round(dec_n / span, 1),
@@ -265,6 +495,82 @@ class Dash:
         """활성 세션 수를 gen_loop 가 직접 알려준다(디코드 정지 중에도 정확)."""
         self._live = int(n)
 
+    # ------------------------------------------------------------ 영속화
+    def attach_store(self, path=DB_PATH, retention_days=RETENTION_DAYS):
+        """SQLite 영속화 시작. 실패해도 라이브 대시보드는 그대로 동작한다."""
+        if not self.enabled or not PERSIST:
+            return None
+        st = Store(path, cfg=self.cfg, retention_days=retention_days,
+                   started_wall=self._t0_wall)
+        if not st.ok:
+            return st
+        self.store = st
+        self._persist = True
+        st.start(self._drain_pending)
+        return st
+
+    def _drain_pending(self):
+        """플러셔 스레드 전용: 대기 이벤트를 INSERT 행 튜플로 변환해 반환.
+
+        락은 **리스트 교체까지만** 잡고 변환은 밖에서 한다(측정 스레드 차단 최소화)."""
+        with self._lock:
+            if not self._pend:
+                return []
+            batch, self._pend = self._pend, []
+        boot, base = self.store.boot_id, self._t0_wall
+        rows = []
+        for e in batch:
+            extra = {k: v for k, v in e.items() if k not in _SKIP}
+            rows.append((
+                boot, e["k"], base + e["t0"], base + e["t1"], e["t0"], e["t1"],
+                e.get("n"), e.get("tps"), e.get("src"), e.get("act"),
+                json.dumps(extra, ensure_ascii=False) if extra else None,
+            ))
+        return rows
+
+    def close(self):
+        if self.store is not None:
+            self.store.close()
+
+    # ------------------------------------------------------- 회고(DB) 조회
+    def history(self, w_from, w_to):
+        """절대 epoch 구간 조회 — 라이브 링버퍼를 건드리지 않고 DB 에서만 읽는다."""
+        if self.store is None or not self.store.ok:
+            return {"error": "persist off", "events": [], "sessions": []}
+        evs, truncated = self.store.read_range(w_from, w_to)
+        sess = [s for s in self.store.sessions()
+                if (s["last_w"] or s["started_wall"]) >= w_from
+                and s["started_wall"] <= w_to]
+        pf_n = pf_d = dec_n = 0.0
+        ttfts, tpcs = [], []
+        for e in evs:
+            if e["k"] == "pf":
+                pf_n += e.get("n", 0); pf_d += e["w1"] - e["w0"]
+            elif e["k"] == "dec":
+                dec_n += e.get("n", 0)
+            elif e["k"] == "req" and e.get("ttft") is not None:
+                ttfts.append(e["ttft"])
+            elif e["k"] == "mtp" and e.get("tpc") is not None:
+                tpcs.append(e["tpc"])
+        span = max(1e-6, w_to - w_from)
+        return {
+            "mode": "history", "from": w_from, "to": w_to,
+            "truncated": truncated,
+            "sessions": sess,
+            "summary": {
+                "n_events": len(evs),
+                "prefill_tps_avg": round(pf_n / pf_d, 1) if pf_d > 0 else 0.0,
+                "prefill_tokens": int(pf_n),
+                "decode_tokens": int(dec_n),
+                "decode_tps_mean_active": round(dec_n / span, 2),
+                "n_req": len(ttfts),
+                "ttft_p50": round(sorted(ttfts)[len(ttfts) // 2], 3) if ttfts else None,
+                "ttft_max": round(max(ttfts), 3) if ttfts else None,
+                "mtp_tpc_mean": round(sum(tpcs) / len(tpcs), 3) if tpcs else None,
+            },
+            "events": evs,
+        }
+
 
 HTML = r"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
@@ -282,6 +588,9 @@ HTML = r"""<!doctype html>
   --mtp:#a78bfa; --ok:#34d399;
 }}
 *{box-sizing:border-box}
+/* .seg/.hbar 이 display:inline-flex|flex 를 갖고 있어 UA 의 [hidden]{display:none}
+   을 특이도로 이긴다 — 명시적으로 눌러야 모드 전환 시 컨트롤이 겹치지 않는다. */
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--ink);
   font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",'Helvetica Neue',
   'Apple SD Gothic Neo',sans-serif;-webkit-font-smoothing:antialiased}
@@ -298,6 +607,11 @@ h1{font-size:16px;font-weight:650;margin:0;letter-spacing:-.01em}
   padding:5px 11px;cursor:pointer}
 .seg button+button{border-left:1px solid var(--line)}
 .seg button[aria-pressed=true]{background:var(--pf);color:#fff}
+.hbar{display:flex;align-items:center;gap:10px;margin:0 0 12px;font-size:12px;
+  color:var(--muted);flex-wrap:wrap}
+.hbar select{font:inherit;font-size:12px;padding:4px 8px;border:1px solid var(--line);
+  border-radius:7px;background:var(--card);color:var(--ink);max-width:520px}
+.hbar #hinfo{font-variant-numeric:tabular-nums}
 .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
 @media(max-width:760px){.tiles{grid-template-columns:repeat(2,1fr)}}
 .tile{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:12px 14px}
@@ -322,18 +636,33 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
   <h1>DSv4-Flash TP2 — 프리필/디코드 실시간 감시</h1>
   <div class="badges" id="badges"></div>
   <div class="spacer"></div>
+  <div class="seg" id="mode">
+    <button data-m="live" aria-pressed="true">라이브</button>
+    <button data-m="history">누적</button>
+  </div>
   <div class="seg" id="win">
     <button data-w="300">5분</button>
     <button data-w="900">15분</button>
     <button data-w="3600" aria-pressed="true">60분</button>
   </div>
+  <div class="seg" id="hwin" hidden>
+    <button data-h="3600">1시간</button>
+    <button data-h="21600">6시간</button>
+    <button data-h="86400" aria-pressed="true">24시간</button>
+    <button data-h="604800">7일</button>
+  </div>
 </header>
+<div id="hbar" class="hbar" hidden>
+  <label>세션</label>
+  <select id="sess"><option value="">전체 구간</option></select>
+  <span id="hinfo"></span>
+</div>
 
 <div class="tiles">
   <div class="tile"><div class="k">프리필 tok/s</div>
-    <div class="v" id="t_pf">–</div><div class="s">최근 5초 이동</div></div>
+    <div class="v" id="t_pf">–</div><div class="s" id="s_pf">최근 5초 이동</div></div>
   <div class="tile"><div class="k">디코드 tok/s</div>
-    <div class="v" id="t_dec">–</div><div class="s">최근 5초 이동</div></div>
+    <div class="v" id="t_dec">–</div><div class="s" id="s_dec">최근 5초 이동</div></div>
   <div class="tile"><div class="k">활성 세션</div>
     <div class="v" id="t_act">–</div><div class="s" id="t_reqs">–</div></div>
   <div class="tile"><div class="k">최근 TTFT</div>
@@ -368,37 +697,92 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
 (function(){
 "use strict";
 var evs=[], next=0, tNow=0, tRef=0, perfRef=performance.now(), cfg={}, nowS={}, win=3600;
+var mode='live', hwin=86400, hist=null, sessions=[], selBoot='', storeS={};
 var tl=document.getElementById('tl'), mtp=document.getElementById('mtp');
 function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
 function fmt(v,d){return v==null?'–':Number(v).toLocaleString('en-US',
   {minimumFractionDigits:d,maximumFractionDigits:d});}
+function clock(ep){var d=new Date(ep*1000);
+  return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2);}
+function stamp(ep){if(!ep)return '–';var d=new Date(ep*1000);
+  return (d.getMonth()+1)+'/'+d.getDate()+' '+clock(ep);}
 
-function setWin(w){
-  var seg=document.getElementById('win'), hit=null;
+function press(seg,attr,val){
+  var hit=null;
   [].forEach.call(seg.querySelectorAll('button'),function(x){
-    var on = (+x.dataset.w===w); if(on) hit=x;
+    var on=(x.dataset[attr]==String(val)); if(on)hit=x;
     x.setAttribute('aria-pressed', on?'true':'false');});
-  if(hit) win=w;
+  return hit;
+}
+function setWin(w){ if(press(document.getElementById('win'),'w',w)) win=w; }
+function setHwin(h){ if(press(document.getElementById('hwin'),'h',h)){ hwin=h; loadHistory(); } }
+
+function setMode(m){
+  mode = (m==='history')?'history':'live';
+  press(document.getElementById('mode'),'m',mode);
+  var h=(mode==='history');
+  document.getElementById('win').hidden=h;
+  document.getElementById('hwin').hidden=!h;
+  document.getElementById('hbar').hidden=!h;
+  if(h){ loadSessions(); loadHistory(); }
 }
 document.getElementById('win').addEventListener('click',function(e){
-  var b=e.target.closest('button'); if(!b)return;
-  setWin(+b.dataset.w);
-});
-// #w=300|900|3600 로 초기 시간창 지정(스크린샷·북마크용)
-(function(){var m=/(?:^|[#&])w=(\d+)/.exec(location.hash); if(m) setWin(+m[1]);})();
-window.addEventListener('hashchange',function(){
-  var m=/(?:^|[#&])w=(\d+)/.exec(location.hash); if(m) setWin(+m[1]);});
+  var b=e.target.closest('button'); if(b) setWin(+b.dataset.w);});
+document.getElementById('hwin').addEventListener('click',function(e){
+  var b=e.target.closest('button'); if(b) setHwin(+b.dataset.h);});
+document.getElementById('mode').addEventListener('click',function(e){
+  var b=e.target.closest('button'); if(b) setMode(b.dataset.m);});
+document.getElementById('sess').addEventListener('change',function(){
+  selBoot=this.value; loadHistory();});
+
+function loadSessions(){
+  fetch('/metrics?sessions=1',{cache:'no-store'}).then(function(r){return r.json();})
+  .then(function(j){
+    sessions=j.sessions||[]; storeS=j.store||{};
+    var s=document.getElementById('sess'), h='<option value="">전체 구간</option>';
+    sessions.forEach(function(x){
+      h+='<option value="'+x.boot_id+'">#'+x.boot_id+'  '+stamp(x.started_wall)+
+         ' → '+(x.ended_wall?stamp(x.ended_wall):'(진행 중)')+
+         '   ·  '+(x.n_events||0).toLocaleString()+' ev</option>';});
+    s.innerHTML=h; s.value=selBoot;
+  }).catch(function(){});
+}
+
+function loadHistory(){
+  var to, from;
+  if(selBoot){
+    var s=null;
+    sessions.forEach(function(x){ if(String(x.boot_id)===String(selBoot)) s=x; });
+    if(s){ from=(s.first_w||s.started_wall)-2; to=(s.last_w||s.ended_wall||Date.now()/1000)+2; }
+  }
+  if(from==null){ to=Date.now()/1000; from=to-hwin; }
+  fetch('/metrics?from='+from.toFixed(3)+'&to='+to.toFixed(3),{cache:'no-store'})
+  .then(function(r){return r.json();}).then(function(j){
+    hist=j; hist.from=from; hist.to=to; tiles(); badges();
+  }).catch(function(){});
+}
+
+// #history / #w=300 / #h=86400 초기 상태(스크린샷·북마크용)
+function fromHash(){
+  var hs=location.hash||'';
+  var w=/(?:^|[#&])w=(\d+)/.exec(hs); if(w) setWin(+w[1]);
+  var hh=/(?:^|[#&])h=(\d+)/.exec(hs); if(hh) hwin=+hh[1];
+  setMode(/(?:^|[#&])history\b/.test(hs) ? 'history' : 'live');
+  if(hh) press(document.getElementById('hwin'),'h',hwin);
+}
+window.addEventListener('hashchange',fromHash);
 
 function poll(){
+  // 라이브 폴링은 인메모리 링버퍼만 읽는다(회고 모드에서도 tile 을 위해 계속 돈다).
   fetch('/metrics?since='+next,{cache:'no-store'}).then(function(r){return r.json();})
   .then(function(j){
     if(j.reset) evs=[];
     if(j.events && j.events.length) evs=evs.concat(j.events);
     next=j.next; tRef=j.t_now; perfRef=performance.now();
-    cfg=j.cfg||{}; nowS=j.now||{};
+    cfg=j.cfg||{}; nowS=j.now||{}; storeS=j.store||storeS;
     var cut=j.t_now-3700;
     if(evs.length && evs[0].t1<cut) evs=evs.filter(function(e){return e.t1>=cut;});
-    tiles(); badges();
+    if(mode==='live'){ tiles(); badges(); }
   }).catch(function(){}).then(function(){setTimeout(poll,1000);});
 }
 
@@ -411,9 +795,14 @@ function badges(){
   if(cfg.chunk) add('chunk '+cfg.chunk);
   if(cfg.min_tokens) add('PP2≥'+cfg.min_tokens+' tok');
   if(cfg.mtp_depth) add('MTP depth '+cfg.mtp_depth);
+  add(storeS.enabled?('영속 ON · boot #'+storeS.boot_id):'영속 off', !!storeS.enabled);
   b.innerHTML=h;
   var up=nowS.uptime_s||0;
   document.getElementById('foot').innerHTML=
+    (storeS.enabled?('영속: <code>'+storeS.path+'</code> · 기록 '+
+      (storeS.written||0).toLocaleString()+'건 · 보존 '+(storeS.retention_days||30)+'일 · '+
+      '재기동해도 <b>누적</b> 탭에서 이전 세션이 그대로 보인다.'+
+      (storeS.err?(' <b>경고: '+storeS.err+'</b>'):'')+'<br>'):'')+
     'rank0 계측 · 랭크1 하단-슬라이스 프리필은 <b>rank0 이음새 시점으로 근사</b>'+
     '(PP2 는 청크마다 랭크1→랭크0 활성값 전송으로 동기되므로 이음새 간격이 곧 '+
     '양 랭크 합산 청크 시간). 프리필 tok/s 는 이음새 <b>본문</b>(인터리브 디코드 '+
@@ -422,7 +811,38 @@ function badges(){
     Math.floor(up/60)+'m'+Math.floor(up%60)+'s';
 }
 
+function setK(tileId,txt){
+  var v=document.getElementById(tileId);
+  if(v&&v.parentNode) v.parentNode.querySelector('.k').textContent=txt;
+}
 function tiles(){
+  if(mode==='history'){
+    var s=(hist&&hist.summary)||{};
+    setK('t_pf','프리필 평균 tok/s'); setK('t_dec','누적 생성 토큰');
+    setK('t_act','요청 수'); setK('t_ttft','TTFT p50');
+    document.getElementById('s_pf').textContent='구간 전체 가중평균';
+    document.getElementById('s_dec').textContent='구간 합계';
+    document.getElementById('t_pf').innerHTML=fmt(s.prefill_tps_avg,0)+'<span class="u">tok/s</span>';
+    document.getElementById('t_dec').innerHTML=fmt(s.decode_tokens,0)+'<span class="u">tok</span>';
+    document.getElementById('t_act').textContent=(s.n_req==null?'–':s.n_req);
+    document.getElementById('t_reqs').textContent=
+      '프리필 '+fmt(s.prefill_tokens,0)+' tok · 이벤트 '+fmt(s.n_events,0);
+    document.getElementById('t_ttft').innerHTML=s.ttft_p50==null?'–':
+      fmt(s.ttft_p50,2)+'<span class="u">s</span>';
+    document.getElementById('t_snap').textContent=
+      s.ttft_max==null?'–':('최대 '+fmt(s.ttft_max,2)+'s');
+    document.getElementById('mtpnow').textContent = s.mtp_tpc_mean!=null?
+      ('  평균 '+s.mtp_tpc_mean.toFixed(2)) : '  데이터 없음';
+    var hi=document.getElementById('hinfo');
+    hi.innerHTML = hist? (stamp(hist.from)+' → '+stamp(hist.to)+
+      '  ·  세션 '+((hist.sessions||[]).length)+'개  ·  이벤트 '+fmt(s.n_events,0)+
+      (hist.truncated?'  ·  <b>상한 초과(구간을 좁히세요)</b>':'')) : '';
+    return;
+  }
+  setK('t_pf','프리필 tok/s'); setK('t_dec','디코드 tok/s');
+  setK('t_act','활성 세션'); setK('t_ttft','최근 TTFT');
+  document.getElementById('s_pf').textContent='최근 5초 이동';
+  document.getElementById('s_dec').textContent='최근 5초 이동';
   document.getElementById('t_pf').innerHTML=fmt(nowS.prefill_tps,0)+'<span class="u">tok/s</span>';
   document.getElementById('t_dec').innerHTML=fmt(nowS.decode_tps,1)+'<span class="u">tok/s</span>';
   document.getElementById('t_act').textContent=nowS.active==null?'–':nowS.active;
@@ -451,20 +871,27 @@ function draw(){
   var L=68, R=10, T=10, B=24, iw=W-L-R;
   var gap=26, th=(H-T-B-gap)/2;
   var pfTop=T, pfBase=T+th, decTop=pfBase+gap, decBase=decTop+th;
-  var t1=tNow, t0=tNow-win, sx=iw/win;
   var line=css('--line'), muted=css('--muted');
+
+  // ── 축 선택 ────────────────────────────────────────────────────────
+  // 라이브: 세션 상대 초(t0/t1), 창은 [now-win, now].
+  // 누적  : 절대 epoch(w0/w1) — 재기동으로 상대시각이 리셋돼도 이어진다.
+  var HIS=(mode==='history' && hist), src, t0, t1, KA, KB;
+  if(HIS){ src=hist.events||[]; t0=hist.from; t1=hist.to; KA='w0'; KB='w1'; }
+  else   { src=evs; t1=tNow; t0=tNow-win; KA='t0'; KB='t1'; }
+  var span=Math.max(1e-6,t1-t0), sx=iw/span;
 
   // ── 가시 이벤트 수집 + 픽셀 열 집계 ────────────────────────────────
   var cols=Math.max(1,Math.round(iw));
   var pfCol=new Float32Array(cols), decCol=new Float32Array(cols);
   var pfAct=new Uint8Array(cols), decAct=new Uint8Array(cols);
   var pfMax=1, decMax=1, mtpPts=[];
-  for(var i=0;i<evs.length;i++){
-    var e=evs[i];
-    if(e.t1<t0) continue;
-    if(e.k==='mtp'){ if(e.t0>=t0) mtpPts.push(e); continue; }
+  for(var i=0;i<src.length;i++){
+    var e=src[i];
+    if(e[KB]<t0||e[KA]>t1) continue;
+    if(e.k==='mtp'){ mtpPts.push(e); continue; }
     if(e.k!=='pf'&&e.k!=='dec') continue;
-    var a=Math.max(0,Math.floor((e.t0-t0)*sx)), b=Math.min(cols-1,Math.ceil((e.t1-t0)*sx));
+    var a=Math.max(0,Math.floor((e[KA]-t0)*sx)), b=Math.min(cols-1,Math.ceil((e[KB]-t0)*sx));
     if(b<a) b=a;
     for(var c=a;c<=b;c++){
       if(e.k==='pf'){ if(e.tps>pfCol[c])pfCol[c]=e.tps; pfAct[c]=1; }
@@ -515,23 +942,51 @@ function draw(){
     x.fillRect(L+c,decBase-hh2,1,hh2);
   }
 
-  // ── 시간축(분) ────────────────────────────────────────────────────
-  var stepM = win<=300?1:(win<=900?3:10);
-  x.fillStyle=muted; x.textAlign='center';
-  for(var m=0;m*60<=win;m+=stepM){
-    var px=L+iw-m*60*sx;
-    if(px<L-1) break;
-    x.globalAlpha=.5; x.beginPath();
-    x.moveTo(Math.round(px)+.5,decBase); x.lineTo(Math.round(px)+.5,decBase+4); x.stroke();
-    x.globalAlpha=1;
-    x.fillText(m===0?'지금':('-'+m+'m'),px,decBase+16);
+  // ── 재기동 경계(누적 뷰) ──────────────────────────────────────────
+  if(HIS && hist.sessions){
+    x.save(); x.setLineDash([3,3]); x.strokeStyle=css('--mtp'); x.lineWidth=1;
+    x.fillStyle=css('--mtp'); x.textAlign='left';
+    x.font='10px ui-monospace,Menlo,monospace';
+    hist.sessions.forEach(function(s){
+      var w=s.started_wall; if(w<t0||w>t1) return;
+      var px=Math.round(L+(w-t0)*sx)+.5;
+      x.beginPath(); x.moveTo(px,pfTop); x.lineTo(px,decBase); x.stroke();
+      x.fillText('#'+s.boot_id, px+3, pfTop+9);
+    });
+    x.restore();
   }
 
-  drawMtp(mtpPts,t0,sx);
+  // ── 시간축 ────────────────────────────────────────────────────────
+  x.fillStyle=muted; x.textAlign='center';
+  if(HIS){
+    var nT=8, stepS=span/nT;
+    var showDate = span>86400*1.5;
+    for(var q=0;q<=nT;q++){
+      var w=t0+stepS*q, px=L+(w-t0)*sx;
+      x.globalAlpha=.5; x.beginPath();
+      x.moveTo(Math.round(px)+.5,decBase); x.lineTo(Math.round(px)+.5,decBase+4); x.stroke();
+      x.globalAlpha=1;
+      var d=new Date(w*1000);
+      x.fillText(showDate?((d.getMonth()+1)+'/'+d.getDate()):clock(w),px,decBase+16);
+    }
+  } else {
+    var stepM = win<=300?1:(win<=900?3:10);
+    for(var m=0;m*60<=win;m+=stepM){
+      var px2=L+iw-m*60*sx;
+      if(px2<L-1) break;
+      x.globalAlpha=.5; x.beginPath();
+      x.moveTo(Math.round(px2)+.5,decBase); x.lineTo(Math.round(px2)+.5,decBase+4); x.stroke();
+      x.globalAlpha=1;
+      x.fillText(m===0?'지금':('-'+m+'m'),px2,decBase+16);
+    }
+  }
+
+  drawMtp(mtpPts,t0,sx,HIS?'w0':'t0');
   requestAnimationFrame(draw);
 }
 
-function drawMtp(pts,t0,sx){
+function drawMtp(pts,t0,sx,KA){
+  KA=KA||'t0';
   var C=fit(mtp), x=C.x, W=C.w, H=C.h, L=54, R=10, T=8, B=14;
   var muted=css('--muted');
   var lo=1, hi=4;
@@ -547,18 +1002,18 @@ function drawMtp(pts,t0,sx){
     x.fillText('MTP 텔레메트리 대기 (시퀀스 종료 시 1건)',L+6,T+13); return; }
   x.strokeStyle=css('--mtp'); x.lineWidth=1.6; x.beginPath();
   pts.forEach(function(p,i){
-    var px=L+(p.t0-t0)*sx, py=H-B-(Math.min(hi,Math.max(lo,p.tpc))-lo)/(hi-lo)*(H-T-B);
+    var px=L+(p[KA]-t0)*sx, py=H-B-(Math.min(hi,Math.max(lo,p.tpc))-lo)/(hi-lo)*(H-T-B);
     i?x.lineTo(px,py):x.moveTo(px,py);
   });
   x.stroke();
   x.fillStyle=css('--mtp');
   pts.forEach(function(p){
-    var px=L+(p.t0-t0)*sx, py=H-B-(Math.min(hi,Math.max(lo,p.tpc))-lo)/(hi-lo)*(H-T-B);
+    var px=L+(p[KA]-t0)*sx, py=H-B-(Math.min(hi,Math.max(lo,p.tpc))-lo)/(hi-lo)*(H-T-B);
     x.beginPath(); x.arc(px,py,2.1,0,6.284); x.fill();
   });
 }
 
-poll(); requestAnimationFrame(draw);
+fromHash(); poll(); requestAnimationFrame(draw);
 })();
 </script></body></html>
 """
